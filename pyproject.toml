@@ -1,0 +1,26 @@
+[project]
+name = "mini-agent"
+version = "0.1.0"
+description = "学习型最小 AI Agent 框架（仿 Hermes 架构，DeepSeek-only）"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40",        # DeepSeek 用 OpenAI 兼容 SDK（base_url 指向 api.deepseek.com）
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["mini_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

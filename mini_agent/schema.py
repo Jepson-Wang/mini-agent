@@ -10,6 +10,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
+#   各个 Role 的功能
+#   system     : 你是 mini-agent...           (开发者设定)
+#   user       : 帮我读一下 a.txt             (用户提问)
+#   assistant  : (content=None,               (模型决定调工具)
+#                 tool_calls=[{id:"call_1", name:"read_file", args:{path:"a.txt"}}])
+#   tool       : (tool_call_id="call_1",      (你执行后回填结果)
+#                 content='{"ok":true,"text":"..."}')
+#   assistant  : 文件内容是 ...                (模型看到结果,给最终答复 → 终止)
 Role = Literal["system", "user", "assistant", "tool"]
 
 

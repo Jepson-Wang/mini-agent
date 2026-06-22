@@ -17,7 +17,6 @@ from pydantic import BaseModel
 #                 tool_calls=[{id:"call_1", name:"read_file", args:{path:"a.txt"}}])
 #   tool       : (tool_call_id="call_1",      (你执行后回填结果)
 #                 content='{"ok":true,"text":"..."}')
-#   assistant  : 文件内容是 ...                (模型看到结果,给最终答复 → 终止)
 Role = Literal["system", "user", "assistant", "tool"]
 
 

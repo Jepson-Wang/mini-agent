@@ -31,6 +31,24 @@ def _module_registers_tools(module_path: Path) -> bool:
     #   但如果registry.register(...)  在一个函数或if中被使用，那么将不会被检测
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
 
+def discover_builtin_tools(path_lib : Optional[Path] = None) -> List[str]:
+    """实现工具自注册"""
+    path = path_lib if path_lib else Path(__file__).resolve().parent
+    module_name = [
+        f"builtin.{p.stem}"
+        for p in sorted(path.glob('*.py'))
+            if p.name not in {'__init__'}
+            and _module_registers_tools(path)
+    ]
+
+    tools = []
+    for mod in module_name:
+        try:
+            importlib.import_module(mod)
+            tools.append(mod)
+        except Exception:
+            pass # TODO 导入日志系统
+    return tools
 
 class ToolEntry:
 

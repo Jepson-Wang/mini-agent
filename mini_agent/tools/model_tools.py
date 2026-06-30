@@ -1,6 +1,7 @@
 import asyncio
 import threading
 from typing import Optional
+from registry import discover_builtin_tools
 
 _tool_loop = None
 _tool_thread_local = threading.local()
@@ -21,6 +22,7 @@ def _get_worker_loop():
 
     return loop
 
+discover_builtin_tools()
 
 def _run_async(fn):
     """

@@ -1,5 +1,6 @@
 import ast
 import importlib
+import json
 import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Callable
@@ -104,5 +105,14 @@ class ToolRegistry:
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
 
-    def dispatch(self) -> str:
-        pass
+    def dispatch(self,name,args,**kwargs) -> str:
+        entry = self.get_entry(name)
+        if not entry:
+            return json.dumps({"error":f"Unknow tool:{name}"})
+        try:
+            if entry.is_async:
+                from model_tools import _run_async
+                return _run_async(entry.handler(args,**kwargs))
+            return entry.handler(args,**kwargs)
+        except Exception as e:
+            return json.dumps({"error":"调用工具函数错误"})

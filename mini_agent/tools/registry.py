@@ -74,6 +74,9 @@ class ToolRegistry:
         self._toolset_checks = Dict[str,Callable] = {}
         self._lock = threading.RLock()
 
+    def get_entry(self) -> Optional[ToolEntry]:
+        pass
+
     def registry(
             self,
             name:str,
@@ -99,3 +102,6 @@ class ToolRegistry:
             )
             if check_fn and toolset not in self._toolset_checks:
                 self._toolset_checks[toolset] = check_fn
+
+    def dispatch(self) -> str:
+        pass

@@ -74,8 +74,9 @@ class ToolRegistry:
         self._toolset_checks = Dict[str,Callable] = {}
         self._lock = threading.RLock()
 
-    def get_entry(self) -> Optional[ToolEntry]:
-        pass
+    def get_entry(self,name: str) -> Optional[ToolEntry]:
+        with self._lock:
+            return self._tools.get(name)
 
     def registry(
             self,

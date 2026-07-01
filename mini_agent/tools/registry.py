@@ -116,3 +116,7 @@ class ToolRegistry:
             return entry.handler(args,**kwargs)
         except Exception as e:
             return json.dumps({"error":"调用工具函数错误"})
+
+    def _snapshot_state(self) -> tuple[list[ToolEntry],Dict[str,Callable]]:
+        with self._lock:
+            return list(self._tools.values()),dict(self._toolset_checks)

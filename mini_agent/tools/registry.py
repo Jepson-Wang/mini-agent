@@ -79,7 +79,7 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
-    def registry(
+    def register(
             self,
             name:str,
             toolset:str,

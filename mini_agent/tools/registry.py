@@ -119,6 +119,8 @@ class ToolRegistry:
             toolset_still_exists = any(
                 e.toolset ==entry.toolset for e in self.tools.values
             )
+            if not toolset_still_exists:
+                self._toolset_checks.pop(entry.toolset,None)
 
 
     def dispatch(self,name,args,**kwargs) -> str:

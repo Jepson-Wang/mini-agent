@@ -117,7 +117,7 @@ class ToolRegistry:
             if entry is None:
                 return
             toolset_still_exists = any(
-                e.toolset ==entry.toolset for e in self.tools.values
+                e.toolset ==entry.toolset for e in self._tools.values()
             )
             if not toolset_still_exists:
                 self._toolset_checks.pop(entry.toolset,None)

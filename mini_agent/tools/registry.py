@@ -102,8 +102,24 @@ class ToolRegistry:
                 handler = handler,
                 check_fn = check_fn
             )
-            if check_fn and toolset not in self._toolset_checks:
-                self._toolset_checks[toolset] = check_fn
+            self._toolset_checks[toolset] = check_fn
+
+    def deregister(self,name) -> None:
+        """
+        1. 加可重入锁
+        2.删除一个ToolEntry
+        3.判断是否还有其他Toolentry,没有则返回，有就删除
+        :param self:
+        :return:
+        """
+        with self._lock:
+            entry = self._tools.pop(name,None)
+            if entry is None:
+                return
+            toolset_still_exists = any(
+                e.toolset ==entry.toolset for e in self.tools.values
+            )
+
 
     def dispatch(self,name,args,**kwargs) -> str:
         entry = self.get_entry(name)

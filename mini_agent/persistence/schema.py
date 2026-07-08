@@ -26,3 +26,12 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 """
+
+EXECUTED_KEYS_CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS executed_keys (
+    idempotency_key TEXT PRIMARY KEY,   -- 唯一标识"某一次工具调用"
+    session_id      TEXT NOT NULL,
+    result          TEXT NOT NULL,      -- 这次调用产生的结果(JSON)
+    created_at      INTEGER NOT NULL
+);
+"""

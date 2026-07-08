@@ -8,7 +8,7 @@ SESSION_CREATE_SQL = (
 
 MESSAGES_CREATE_SQL = (
     "CREATE TABLE messages ("
-    "session_id  TEXT    NOT NULL,"
+    "session_id  TEXT    NOT NULL AUTOINCREMENT,"
     "seq  NOT NULL,"
     "role        TEXT    NOT NULL,"
     "role        TEXT    NOT NULL,     -- 'assistant' / 'tool' / 'user' / 'system'"

@@ -38,16 +38,16 @@ class FakeLLM:
 def fake_llm(monkeypatch):
     """用法：llm = fake_llm([FakeMessage(content="hi"), ...])。
 
-    会把 agent.call_llm 替换成 FakeLLM 实例。
+    会把 mini_agent.agent.call_llm 替换成 FakeLLM 实例。
 
-    注意 patch 目标写的是 "agent.call_llm" 而不是 "mini_agent.agent.call_llm"：
-    全项目以 mini_agent/ 为 source root 做绝对 import（from llm import call_llm），
-    模块的真身就叫 `agent`。若写成 mini_agent.agent，同一份代码会被加载成第二个
-    模块对象，patch 打在副本上，对真正跑着的那个毫无作用。
+    patch 目标必须和模块的**真实全名**一致。全项目只用包绝对 import
+    （from mini_agent.llm import call_llm），所以模块只有 mini_agent.agent
+    这一个身份。若项目里同时存在裸名 `agent` 和 `mini_agent.agent`，同一份代码
+    会被加载成两个模块对象，patch 打在副本上，对真正跑着的那个毫无作用。
     """
     def _make(scripted: list[FakeMessage]) -> FakeLLM:
         llm = FakeLLM(scripted)
-        monkeypatch.setattr("agent.call_llm", llm)
+        monkeypatch.setattr("mini_agent.agent.call_llm", llm)
         return llm
 
     return _make

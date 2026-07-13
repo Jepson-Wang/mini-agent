@@ -13,7 +13,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from config import settings
+from mini_agent.config import settings
 
 _client: OpenAI | None = None
 

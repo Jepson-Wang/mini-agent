@@ -16,11 +16,8 @@ import time
 
 import pytest
 
-# 注意：这里的 import 风格和被测模块自己一致（mini_agent/ 是 source root）。
-# 如果这里写 `from mini_agent.schema import Message`，拿到的会是**另一个**
-# Message 类对象（同一份代码被加载成两个模块），isinstance 断言会离奇失败。
-from persistence.session_db import MiniSessionDB, PersistenceError
-from schema import Message, ToolCall
+from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
+from mini_agent.schema import Message, ToolCall
 
 
 @pytest.fixture

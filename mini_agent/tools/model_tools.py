@@ -1,7 +1,7 @@
 import asyncio
 import threading
 from typing import Optional
-from registry import discover_builtin_tools
+from mini_agent.tools.registry import discover_builtin_tools
 
 _tool_loop = None
 _tool_thread_local = threading.local()

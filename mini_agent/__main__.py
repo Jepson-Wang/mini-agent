@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import sys
 
-from agent import Agent
-from config import settings
+from mini_agent.agent import Agent
+from mini_agent.config import settings
 
 
 def main() -> None:

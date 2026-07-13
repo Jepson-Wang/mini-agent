@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from agent import Agent
+from mini_agent.agent import Agent
 from tests.conftest import FakeMessage
 
 
@@ -68,7 +68,7 @@ def test_budget_exhaustion_stops(fake_llm, monkeypatch):
             self.calls.append(messages)
             return forever_tool
 
-    monkeypatch.setattr("agent.call_llm", Loop())
+    monkeypatch.setattr("mini_agent.agent.call_llm", Loop())
     agent = Agent(max_turns=3)
 
     out = agent.run_conversation("go")

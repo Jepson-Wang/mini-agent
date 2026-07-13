@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import threading
 
-from llm import call_llm
-from schema import Message
+from mini_agent.llm import call_llm
+from mini_agent.schema import Message
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are mini-agent, a helpful AI assistant. "

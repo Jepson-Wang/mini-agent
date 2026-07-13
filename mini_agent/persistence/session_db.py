@@ -7,13 +7,13 @@ from contextlib import contextmanager
 
 from pydantic import ValidationError
 
-from log import get_logger
-from persistence.schema import (
+from mini_agent.log import get_logger
+from mini_agent.persistence.schema import (
     SESSION_CREATE_SQL,
     MESSAGES_CREATE_SQL,
     EXECUTED_KEYS_CREATE_SQL,
 )
-from schema import Message
+from mini_agent.schema import Message
 
 logger = get_logger(__name__)
 

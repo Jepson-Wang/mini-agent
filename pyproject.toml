@@ -24,7 +24,7 @@ packages = ["mini_agent"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# 全项目以 mini_agent/ 为 source root 做绝对 import（from schema import ...、
-# from persistence.schema import ...），所以 mini_agent/ 必须在 sys.path 上
-# （IDE 里靠 Sources Root，命令行靠这一行）。"." 是为了 tests 包自身。
-pythonpath = [".", "mini_agent"]
+# 全项目一律用包绝对 import（from mini_agent.schema import ...），所以只需要
+# 项目根在 sys.path 上。绝不要把 mini_agent/ 本身加进来——那会让 schema / config
+# / log 这些通用名变成顶层模块，既污染命名空间，又让同一份代码有两个模块身份。
+pythonpath = ["."]

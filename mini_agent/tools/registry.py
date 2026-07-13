@@ -36,8 +36,12 @@ def _module_registers_tools(module_path: Path) -> bool:
 def discover_builtin_tools(path_lib : Optional[Path] = None) -> List[str]:
     """实现工具自注册"""
     path = path_lib if path_lib else Path(__file__).resolve().parent
+    # 动态 import 必须用**包全名**（mini_agent.tools.builtin.xxx），不能用裸名。
+    # 裸名要么 import 不到，要么把同一份代码加载成第二个模块对象——那样 @tool
+    # 会注册进两个不同的 _TOOLS 字典，是最难 debug 的一类 bug。
+    # 用 __package__（= "mini_agent.tools"）拼，将来改包名也不会坏。
     module_name = [
-        f"builtin.{p.stem}"
+        f"{__package__}.builtin.{p.stem}"
         for p in sorted(path.glob('*.py'))
             if p.name not in {'__init__'}
             and _module_registers_tools(path)

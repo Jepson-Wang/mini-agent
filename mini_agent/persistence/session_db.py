@@ -114,3 +114,18 @@ class MiniSessionDB:
             # else: 这一轮残缺 → 整轮丢弃(assistant 和它那些孤儿 result 都不进 kept)
 
         return kept
+
+    def recover(self,session_id) -> list[Message]:
+        """
+        从磁盘上的事实,重建出一个"可以安全地继续跑主循环"的内存状态。
+        就这一件。它不执行工具、不调 LLM、不写任何东西(除了可能改 session status)。
+        它是纯读 + 重建。
+        """
+        c = self.conn
+        rows = c.execute(
+            "SELECT content FROM MESSAGES WHERE session_id = ? ORDER BY seq;",(session_id,)
+        ).fetchall()
+        messages = [Message.model_validate_json(row[0]) for row in rows]
+        messages = self._sanitize_dangling_tool_calls(messages)
+        return messages
+

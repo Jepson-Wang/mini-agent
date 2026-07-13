@@ -18,6 +18,7 @@ class PersistenceError(Exception):
 
 _VALID_ROLES = {"system", "user", "assistant", "tool"}
 
+
 class MiniSessionDB:
 
     def __init__(self, path: str):
@@ -34,16 +35,44 @@ class MiniSessionDB:
         c.execute("PRAGMA busy_timeout=5000;")  # 拿不到锁时等 5s 再报 BUSY
         c.execute("PRAGMA synchronous=NORMAL;")  # ← 这个留给你决定
 
-    def create_session(self) -> str:
-        """建一个新 session，返回 sid。append_message 的前置。"""
-        sid = f"sess_{uuid.uuid4().hex[:12]}"
-        now = int(time.time())
-        with self._write_txn() as c:
-            c.execute(
-                "INSERT INTO sessions (session_id,status, created_at, updated_at) "                    
-                "VALUES (?, ?, ?, ?);",(sid, "running", now, now,)
-            )
-        return sid
+    # ---------- 异常收敛：底层 sqlite/json 异常 → PersistenceError ----------
+
+    @contextmanager
+    def _db_guard(self, what: str, hint: str = ""):
+        """把底层异常统一翻译成 PersistenceError,附带"是哪个操作、什么上下文"。
+
+        只翻译,不吞:异常照样往上抛,只是换了个类型 + 加了上下文,
+        并用 `raise ... from e` 保住异常链(traceback 里还能看到原始 sqlite 错误)。
+
+        为什么值得做:调用方(agent / __main__)不该 import sqlite3 才能写 except。
+        持久化层是一个模块边界,边界上就该只暴露自己的异常类型。
+        注意 PersistenceError 本身直接放行,避免被二次包裹成套娃。
+        """
+        tail = f" {hint}" if hint else ""
+        try:
+            yield
+        except PersistenceError:
+            raise  # 已经是本层异常,原样上抛
+        except sqlite3.IntegrityError as e:
+            # 外键缺失 / 主键冲突 —— 通常是调用方的逻辑错误
+            raise PersistenceError(
+                f"{what}: 完整性约束失败(外键缺失 / 主键冲突)。{tail} 原始错误: {e}"
+            ) from e
+        except sqlite3.OperationalError as e:
+            # 锁超时 / 磁盘问题 / SQL 写错 —— 环境或 SQL 问题(这里也可以加重试)
+            raise PersistenceError(
+                f"{what}: 数据库操作失败(锁超时 / 磁盘 / SQL 错误)。{tail} 原始错误: {e}"
+            ) from e
+        except sqlite3.Error as e:
+            # 兜底:sqlite3 的其余异常(DatabaseError / ProgrammingError ...)
+            raise PersistenceError(
+                f"{what}: sqlite 错误 {type(e).__name__}。{tail} 原始错误: {e}"
+            ) from e
+        except json.JSONDecodeError as e:
+            # 库里存的 JSON 坏了 —— 数据损坏,不是程序 bug
+            raise PersistenceError(
+                f"{what}: 库中 JSON 无法反序列化(数据损坏)。{tail} 原始错误: {e}"
+            ) from e
 
     @contextmanager
     def _write_txn(self):
@@ -58,31 +87,50 @@ class MiniSessionDB:
             raise
 
     def _create_tables(self):
-        with self._write_txn():
-            c = self.conn
-            c.execute(SESSION_CREATE_SQL)
-            c.execute(MESSAGES_CREATE_SQL)
-            c.execute(EXECUTED_KEYS_CREATE_SQL)
+        with self._db_guard("_create_tables"):
+            with self._write_txn() as c:
+                c.execute(SESSION_CREATE_SQL)
+                c.execute(MESSAGES_CREATE_SQL)
+                c.execute(EXECUTED_KEYS_CREATE_SQL)
+
+    # ---------- session 生命周期 ----------
+
+    def create_session(self) -> str:
+        """建一个新 session，返回 sid。append_message 的前置。"""
+        sid = f"sess_{uuid.uuid4().hex[:12]}"
+        now = int(time.time())
+        with self._db_guard("create_session"):
+            with self._write_txn() as c:
+                c.execute(
+                    "INSERT INTO sessions (session_id, status, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?);",
+                    (sid, "running", now, now),
+                )
+        return sid
 
     def session_exists(self, session_id) -> bool:
         """
-        用户 - -resume sess_xxx 时先校验，不存在就早报错
+        用户 --resume sess_xxx 时先校验，不存在就早报错
         """
-        c = self.conn
-        row = c.execute(
-            "SELECT 1 FROM sessions WHERE session_id=? LIMIT 1;",(session_id,)
-        ).fetchone()
+        with self._db_guard(f"session_exists(session={session_id})"):
+            row = self.conn.execute(
+                "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1;", (session_id,)
+            ).fetchone()
         return row is not None
 
     def end_session(self, session_id) -> None:
         """
         __main__.py 正常退出时会调它
         """
-        with self._write_txn() as c:
-            c.execute(
-                "UPDATE sessions SET status='done',updated_at=? WHERE session_id = ?;",
-                (int(time.time()),session_id,)
-            )
+        with self._db_guard(f"end_session(session={session_id})"):
+            with self._write_txn() as c:
+                c.execute(
+                    "UPDATE sessions SET status = 'done', updated_at = ? "
+                    "WHERE session_id = ?;",
+                    (int(time.time()), session_id),
+                )
+
+    # ---------- 崩溃恢复 ----------
 
     def _sanitize_dangling_tool_calls(self, messages: list[Message]) -> list[Message]:
         """
@@ -115,107 +163,107 @@ class MiniSessionDB:
 
         return kept
 
-    def recover(self,session_id) -> list[Message]:
+    def recover(self, session_id) -> list[Message]:
         """
         从磁盘上的事实,重建出一个"可以安全地继续跑主循环"的内存状态。
         就这一件。它不执行工具、不调 LLM、不写任何东西(除了可能改 session status)。
         它是纯读 + 重建。
         """
-        c = self.conn
-        rows = c.execute(
-            "SELECT content FROM MESSAGES WHERE session_id = ? ORDER BY seq;",(session_id,)
-        ).fetchall()
-        messages = [Message.model_validate_json(row[0]) for row in rows]
-        messages = self._sanitize_dangling_tool_calls(messages)
-        return messages
+        with self._db_guard(f"recover(session={session_id})"):
+            rows = self.conn.execute(
+                "SELECT content FROM messages WHERE session_id = ? ORDER BY seq;",
+                (session_id,),
+            ).fetchall()
+            messages = [Message.model_validate_json(row["content"]) for row in rows]
 
-    # 幂等表的相关操作，两个方法分别用于获取tool结果和记录tool结果
+        return self._sanitize_dangling_tool_calls(messages)
+
+    # ---------- 幂等表:两个方法分别用于获取 tool 结果和记录 tool 结果 ----------
 
     def get_executed_result(self, key: str) -> dict | None:
         """查幂等缓存。命中返回 result dict,未命中返回 None。纯读,不开写事务。"""
         if not key:
             raise PersistenceError("get_executed_result: key 不能为空")
-        row = self.conn.execute(
-            "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
-        ).fetchone()
-        if row is None:
-            return None
-        return json.loads(row[0])
 
-    def record_executed_key(self, key: str, session_id: str, result: dict) -> tuple[bool, dict]:
+        with self._db_guard(f"get_executed_result(key={key})"):
+            row = self.conn.execute(
+                "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
+            ).fetchone()
+            if row is None:
+                return None
+            return json.loads(row["result"])
+
+    def record_executed_key(
+        self, key: str, session_id: str, result: dict
+    ) -> tuple[bool, dict]:
         """
         返回 (is_first, canonical_result)。
         - 用 ON CONFLICT(idempotency_key) DO NOTHING,看 rowcount 判断 is_first。
         - is_first=True  → canonical 就是你传进来的 result
-        - is_first=False → 你必须把表里那条已存在的 result 读出来返回
+        - is_first=False → 把表里那条已存在的 result 读出来返回(它才是权威值)
           ★ 关键:这个"读回来"的 SELECT,必须和上面的 INSERT 在同一个
-            BEGIN IMMEDIATE 事务里 —— 想清楚为什么(如果分开,读回来的
-            权威值可能又被第三个并发写者改掉吗?或者说,你能保证读到的
-            就是你 INSERT 时撞上的那一条吗?)
+            BEGIN IMMEDIATE 事务里 —— 否则读到的可能不是你刚撞上的那一条。
         """
-        if not isinstance(result,dict):
+        if not isinstance(result, dict):
             raise PersistenceError("record_executed_key: result应该为字典格式")
         result_json = json.dumps(result)
 
-        with self._write_txn() as c:
-            cur = c.execute(
-                "INSERT INTO executed_keys "
-                "(idempotency_key, session_id, result, created_at) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(idempotency_key) DO NOTHING;",
-                (key, session_id, result_json, int(time.time()),),
-            )
-            if cur.rowcount == 1:
-                return True,result
-            elif cur.rowcount == 0:
-                # 将INSERT 和 SELECT 放入同一个事务中，原因：
-                # 1. 少一次锁获取、少一次事务开销。 事务已经开着了,SELECT 顺手就做了
+        with self._db_guard(f"record_executed_key(key={key})"):
+            with self._write_txn() as c:
+                cur = c.execute(
+                    "INSERT INTO executed_keys "
+                    "(idempotency_key, session_id, result, created_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(idempotency_key) DO NOTHING;",
+                    (key, session_id, result_json, int(time.time())),
+                )
+                if cur.rowcount == 1:
+                    return True, result
+
+                # rowcount == 0 → 这个 key 已经存在,读回权威结果
+                # 把 INSERT 和 SELECT 放同一个事务里,原因:
+                # 1. 少一次锁获取、少一次事务开销。事务已经开着了,SELECT 顺手就做了
                 # 2. (更重要)不要让代码的正确性,依赖一个"读代码的人看不见的假设"。
                 row = c.execute(
-                    "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
+                    "SELECT result FROM executed_keys WHERE idempotency_key = ?;",
+                    (key,),
                 ).fetchone()
                 if row is None:
-                    raise PersistenceError(f"executed_keys 不变量被破坏: key={key} 冲突但不存在")
-                return False, json.loads(row[0])
+                    raise PersistenceError(
+                        f"executed_keys 不变量被破坏: key={key} 冲突但不存在"
+                    )
+                return False, json.loads(row["result"])
+
+    # ---------- 消息落库 ----------
 
     def append_message(self, session_id: str, msg: Message) -> int:
         """
         写一条 message,返回它的 seq。
         约束:
-        - seq 是 session 内自增(不是全局 rowid)。你要在同一个事务里
-          算出"这个 session 当前最大 seq + 1"并插入 —— 想想为什么算 seq
-          和插入必须在同一个 BEGIN IMMEDIATE 里,否则并发/重跑会怎样?
-        - content 是 dict,存进 TEXT 列前你要做什么?
-        - 用 self._write_txn()。
+        - seq 是 session 内自增(不是全局 rowid)。算 seq 和插入必须在同一个
+          BEGIN IMMEDIATE 里,否则并发/重跑会算出同一个 seq 撞主键。
+        - content 存整条 Message 的 JSON(model_dump_json,能无损 round-trip)。
         """
         if not session_id:
             raise PersistenceError("append_message: session_id 不能为空")
         if msg.role not in _VALID_ROLES:
             raise PersistenceError(f"append_message: 非法 role={msg.role!r}")
 
-            # ③ 写库：按异常类型分层处理
-        try:
+        with self._db_guard(
+            f"append_message(session={session_id}, role={msg.role})",
+            hint="(IntegrityError 通常是没先 create_session)",
+        ):
             with self._write_txn() as c:
                 row = c.execute(
                     "SELECT MAX(seq) FROM messages WHERE session_id = ?;",
                     (session_id,),
                 ).fetchone()
+                # 聚合函数必然返回一行,所以这里判的是 row[0] is None(空表),
+                # 而不是 row is None
                 seq = 0 if row[0] is None else row[0] + 1
                 c.execute(
                     "INSERT INTO messages (session_id, seq, role, content, created_at) "
                     "VALUES (?, ?, ?, ?, ?);",
-                    (session_id, seq, msg.role, msg.model_dump_json(), int(time.time()),),
+                    (session_id, seq, msg.role, msg.model_dump_json(), int(time.time())),
                 )
             return seq
-        except sqlite3.IntegrityError as e:
-            # 外键缺失 / 主键冲突 —— 通常是调用方的逻辑错误，包清楚再上抛
-            raise PersistenceError(
-                f"append_message: 完整性约束失败 (session={session_id}, role={msg.role}). "
-                f"是不是没先 create_session？原始错误: {e}"
-            ) from e
-        except sqlite3.OperationalError as e:
-            # 锁超时 / 磁盘问题 —— 环境问题，原样包装上抛（这里也可以做重试）
-            raise PersistenceError(
-                f"append_message: 数据库操作失败 (session={session_id}): {e}"
-            ) from e
-

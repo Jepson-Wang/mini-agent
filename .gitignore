@@ -1,1 +1,28 @@
+# 密钥，永远不入库
 .env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 虚拟环境
+.venv/
+venv/
+
+# 运行时产物：SQLite 库（含 WAL / shm 边车文件）、日志
+*.db
+*.db-wal
+*.db-shm
+.mini_agent/
+
+# 测试 / 工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/

@@ -57,4 +57,11 @@ class MiniSessionDB:
             c.execute("ROLLBACK;")
             raise
 
+    def _create_tables(self):
+        with self._write_txn():
+            c = self.conn
+            c.execute(SESSION_CREATE_SQL)
+            c.execute(MESSAGES_CREATE_SQL)
+            c.execute(EXECUTED_KEYS_CREATE_SQL)
+
 

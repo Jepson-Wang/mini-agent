@@ -45,3 +45,16 @@ class MiniSessionDB:
             )
         return sid
 
+    @contextmanager
+    def _write_txn(self):
+        """一次原子写。BEGIN IMMEDIATE 立即拿写锁,失败即回滚。"""
+        c = self.conn
+        c.execute("BEGIN IMMEDIATE;")  # 立即申请写锁,不拖到第一条写语句
+        try:
+            yield c
+            c.execute("COMMIT;")
+        except Exception:
+            c.execute("ROLLBACK;")
+            raise
+
+

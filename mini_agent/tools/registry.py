@@ -20,6 +20,45 @@ def _error(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
 
 
+def _check_available(entry: "ToolEntry") -> bool:
+    """跑工具的 check_fn，判断它此刻是否可用。没有 check_fn 就当作永远可用。
+
+    check_fn 自己抛异常 → 一律视为不可用。一个"探测 API key 在不在"的函数
+    自己炸了，不该把整个 agent 拖下水；最坏结果只是少一个工具。
+    """
+    if entry.check_fn is None:
+        return True
+    try:
+        return bool(entry.check_fn())
+    except Exception as e:
+        logger.warning("工具 %s 的 check_fn 抛异常，视为不可用: %s: %s",
+                       entry.name, type(e).__name__, e)
+        return False
+
+
+def _to_openai_tool_schema(entry: "ToolEntry") -> dict:
+    """ToolEntry → DeepSeek / OpenAI 的 tools 元素形状。
+
+    外层必须是 {"type": "function", "function": {...}}——这是 OpenAI Chat
+    Completions 的规定形状，DeepSeek 原生兼容。（对比 Anthropic 是扁平的
+    {"name", "description", "input_schema"}，形状完全不同；provider adapter
+    要负责的就是这层转换。我们只接 DeepSeek，所以只有这一种。）
+
+    parameters 必须是合法的 JSON Schema object。工具没声明参数时也要给一个
+    空的 object 骨架，不能省略——省略了部分实现会 400。
+    """
+    schema = entry.schema or {}
+    parameters = schema.get("parameters") or {"type": "object", "properties": {}}
+    return {
+        "type": "function",
+        "function": {
+            "name": entry.name,
+            "description": entry.description or schema.get("description", ""),
+            "parameters": parameters,
+        },
+    }
+
+
 def _is_registry_register_call(node: ast.AST) -> bool:
     """如果node是一个registry.register()的形式就返回True"""
     if not isinstance(node, ast.Expr) or not isinstance(node.value, ast.Call):
@@ -112,6 +151,45 @@ class ToolRegistry:
         with self._lock:
             return self._tools.get(name)
 
+    def get_definitions(
+        self,
+        toolset: Optional[set[str]] = None,
+        disabled: Optional[set[str]] = None,
+    ) -> List[dict]:
+        """把注册表里可用的工具，转成 DeepSeek / OpenAI 要的 tools 参数。
+
+        这是「注册表」和「模型」之间唯一的接口：agent 每轮把它的返回值传给
+        call_llm(messages, tools=...)。工具没出现在这里，对模型来说就等于不存在。
+
+        三步过滤：
+          1. toolset 过滤 —— 只暴露 agent 被授权的工具集。M4 的子代理靠这一步做
+             最小权限（子 toolset ⊆ 父 toolset）。传 None 表示不过滤（全部）。
+          2. disabled 黑名单 —— 按工具名精确剔除。M4 从子代理身上剥离
+             delegate_task（禁递归）走的就是这条。
+          3. check_fn —— 运行时可用性检查（API key 在不在、二进制装没装）。
+             check_fn 抛异常一律视为不可用：一个探测函数自己炸了，不该把
+             整个 agent 拖下水。
+
+        ★ 输出按工具名排序，顺序**必须稳定**。
+          DeepSeek 有自动的上下文缓存，命中的前提是请求前缀逐字节不变；tools 是
+          前缀的一部分，今天 [read_file, web_fetch]、明天 [web_fetch, read_file]，
+          缓存就整个失效了。而 dict 的迭代顺序会随注册顺序（= import 顺序）变化，
+          所以这里显式排序，不依赖插入顺序。
+        """
+        with self._lock:
+            entries = list(self._tools.values())
+
+        defs: List[dict] = []
+        for entry in sorted(entries, key=lambda e: e.name):
+            if toolset is not None and entry.toolset not in toolset:
+                continue
+            if disabled and entry.name in disabled:
+                continue
+            if not _check_available(entry):
+                continue
+            defs.append(_to_openai_tool_schema(entry))
+        return defs
+
     def register(
             self,
             name:str,
@@ -125,7 +203,14 @@ class ToolRegistry:
         with self._lock:
             existing = self._tools.get(name)
             if existing and existing.toolset != toolset:
-                pass    #TODO 后续需要补全
+                # 同名工具在不同 toolset 里重复注册 —— 多半是命名撞车或误注册。
+                # 保持"后注册者覆盖"，但绝不静默：不报出来的话，一个工具被另一个
+                # 顶掉、模型调到的是意外的那个，是能查一整天的 bug。
+                # （同 toolset 的重复注册是幂等 re-import，属正常，不告警。）
+                logger.warning(
+                    "工具名冲突：%r 已在 toolset=%r 注册，现被 toolset=%r 覆盖",
+                    name, existing.toolset, toolset,
+                )
             self._tools[name] =ToolEntry(
                 name=name,
                 toolset=toolset,
@@ -190,15 +275,34 @@ class ToolRegistry:
                 f"got {type(args).__name__}"
             )
 
+        # kwargs 是 loop 注入的可信上下文（如 session_id），args 是模型发来的不可信
+        # 参数。两者撞名时**绝不静默覆盖** —— 否则模型只要发一个同名 session_id 就能
+        # 顶掉运行时注入的真值，是一类安全隐患。撞了就明确报错，让它当场暴露。
+        collisions = set(args) & set(kwargs)
+        if collisions:
+            return _error(
+                f"Argument name conflict for {name}: {sorted(collisions)} "
+                "由运行时注入，模型不能提供同名参数"
+            )
         call_args: dict[str, Any] = {**args, **kwargs}
 
         # 先做参数绑定校验，再执行。这样「模型把参数名写错了」和「工具内部炸了」
         # 是两类不同的错误，给模型两种不同的提示：前者它改个参数名就能自救，
         # 后者它得换个思路。混成一句 TypeError 的话，模型只会原地打转。
+        #
+        # signature() 对少数可调用对象（C 实现的内置函数、某些 partial）会抛
+        # ValueError；此时无法内省，就**跳过预校验**、把判断交给真正的调用，
+        # 而不是把它当成参数错误 —— 否则 ValueError 会逃出 dispatch，破坏
+        # 「绝不抛异常」的契约。
         try:
-            inspect.signature(entry.handler).bind(**call_args)
-        except TypeError as e:
-            return _error(f"Invalid arguments for {name}: {e}")
+            sig = inspect.signature(entry.handler)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None:
+            try:
+                sig.bind(**call_args)
+            except TypeError as e:
+                return _error(f"Invalid arguments for {name}: {e}")
 
         try:
             if entry.is_async:

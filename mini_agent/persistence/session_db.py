@@ -178,3 +178,44 @@ class MiniSessionDB:
                     raise PersistenceError(f"executed_keys 不变量被破坏: key={key} 冲突但不存在")
                 return False, json.loads(row[0])
 
+    def append_message(self, session_id: str, msg: Message) -> int:
+        """
+        写一条 message,返回它的 seq。
+        约束:
+        - seq 是 session 内自增(不是全局 rowid)。你要在同一个事务里
+          算出"这个 session 当前最大 seq + 1"并插入 —— 想想为什么算 seq
+          和插入必须在同一个 BEGIN IMMEDIATE 里,否则并发/重跑会怎样?
+        - content 是 dict,存进 TEXT 列前你要做什么?
+        - 用 self._write_txn()。
+        """
+        if not session_id:
+            raise PersistenceError("append_message: session_id 不能为空")
+        if msg.role not in _VALID_ROLES:
+            raise PersistenceError(f"append_message: 非法 role={msg.role!r}")
+
+            # ③ 写库：按异常类型分层处理
+        try:
+            with self._write_txn() as c:
+                row = c.execute(
+                    "SELECT MAX(seq) FROM messages WHERE session_id = ?;",
+                    (session_id,),
+                ).fetchone()
+                seq = 0 if row[0] is None else row[0] + 1
+                c.execute(
+                    "INSERT INTO messages (session_id, seq, role, content, created_at) "
+                    "VALUES (?, ?, ?, ?, ?);",
+                    (session_id, seq, msg.role, msg.model_dump_json(), int(time.time()),),
+                )
+            return seq
+        except sqlite3.IntegrityError as e:
+            # 外键缺失 / 主键冲突 —— 通常是调用方的逻辑错误，包清楚再上抛
+            raise PersistenceError(
+                f"append_message: 完整性约束失败 (session={session_id}, role={msg.role}). "
+                f"是不是没先 create_session？原始错误: {e}"
+            ) from e
+        except sqlite3.OperationalError as e:
+            # 锁超时 / 磁盘问题 —— 环境问题，原样包装上抛（这里也可以做重试）
+            raise PersistenceError(
+                f"append_message: 数据库操作失败 (session={session_id}): {e}"
+            ) from e
+

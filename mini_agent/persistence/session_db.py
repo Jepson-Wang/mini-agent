@@ -1,15 +1,21 @@
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 
+from pydantic import ValidationError
+
+from log import get_logger
 from persistence.schema import (
     SESSION_CREATE_SQL,
     MESSAGES_CREATE_SQL,
     EXECUTED_KEYS_CREATE_SQL,
 )
 from schema import Message
+
+logger = get_logger(__name__)
 
 
 class PersistenceError(Exception):
@@ -23,8 +29,13 @@ class MiniSessionDB:
 
     def __init__(self, path: str):
         # isolation_level=None → 关掉 Python 的隐式事务管理(见下方"坑")
-        self.conn = sqlite3.connect(path, isolation_level=None)
+        # check_same_thread=False → M1 的并行只读工具、M4 的子代理都会跨线程用同一个 db。
+        #   但光开这个不够:两个线程同时 BEGIN IMMEDIATE 会撞
+        #   "cannot start a transaction within a transaction"(那是连接级状态,
+        #   不是数据库级锁)。所以写事务再用一把 RLock 串行化,见 _write_txn。
+        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self._txn_lock = threading.RLock()
         self._configure()
         self._create_tables()
 
@@ -76,15 +87,21 @@ class MiniSessionDB:
 
     @contextmanager
     def _write_txn(self):
-        """一次原子写。BEGIN IMMEDIATE 立即拿写锁,失败即回滚。"""
-        c = self.conn
-        c.execute("BEGIN IMMEDIATE;")  # 立即申请写锁,不拖到第一条写语句
-        try:
-            yield c
-            c.execute("COMMIT;")
-        except Exception:
-            c.execute("ROLLBACK;")
-            raise
+        """一次原子写。BEGIN IMMEDIATE 立即拿写锁,失败即回滚。
+
+        RLock:同一连接上不能并发开事务(见 __init__ 注释)。用 R 版而不是普通
+        Lock,是为了让"不小心嵌套 _write_txn"暴露成 sqlite 的显式报错,
+        而不是变成一个静默死锁。
+        """
+        with self._txn_lock:
+            c = self.conn
+            c.execute("BEGIN IMMEDIATE;")  # 立即申请写锁,不拖到第一条写语句
+            try:
+                yield c
+                c.execute("COMMIT;")
+            except Exception:
+                c.execute("ROLLBACK;")
+                raise
 
     def _create_tables(self):
         with self._db_guard("_create_tables"):
@@ -159,7 +176,12 @@ class MiniSessionDB:
             if all(r is not None for r in claimed):
                 kept.append(msg)
                 kept.extend(claimed)  # ★ 按 expected_ids 顺序输出,顺便修复乱序
-            # else: 这一轮残缺 → 整轮丢弃(assistant 和它那些孤儿 result 都不进 kept)
+            else:
+                # 这一轮残缺(崩在"assistant 已落库、tool 结果没落库"的瞬间)
+                # → 整轮丢弃,否则发给 DeepSeek 必 400
+                logger.warning(
+                    "recover: 丢弃残缺的一轮 tool 调用, tool_call_ids=%s", expected_ids
+                )
 
         return kept
 
@@ -168,13 +190,28 @@ class MiniSessionDB:
         从磁盘上的事实,重建出一个"可以安全地继续跑主循环"的内存状态。
         就这一件。它不执行工具、不调 LLM、不写任何东西(除了可能改 session status)。
         它是纯读 + 重建。
+
+        容错:单行 content 损坏(JSON 坏了 / schema 对不上)时,跳过这一行并告警,
+        而不是让整个 --resume 崩掉 —— 崩溃恢复本身就不该被一行脏数据打死。
         """
         with self._db_guard(f"recover(session={session_id})"):
             rows = self.conn.execute(
-                "SELECT content FROM messages WHERE session_id = ? ORDER BY seq;",
+                "SELECT seq, content FROM messages WHERE session_id = ? ORDER BY seq;",
                 (session_id,),
             ).fetchall()
-            messages = [Message.model_validate_json(row["content"]) for row in rows]
+
+        messages: list[Message] = []
+        for row in rows:
+            try:
+                messages.append(Message.model_validate_json(row["content"]))
+            except (ValidationError, ValueError) as e:
+                # ValueError 覆盖 JSONDecodeError;两者都属于"这一行的数据坏了"
+                logger.warning(
+                    "recover: 跳过损坏的消息行 session=%s seq=%s: %s",
+                    session_id,
+                    row["seq"],
+                    e,
+                )
 
         return self._sanitize_dangling_tool_calls(messages)
 
@@ -206,7 +243,16 @@ class MiniSessionDB:
         """
         if not isinstance(result, dict):
             raise PersistenceError("record_executed_key: result应该为字典格式")
-        result_json = json.dumps(result)
+
+        try:
+            # ensure_ascii=False:中文原样存,库里可读,也省一半空间
+            result_json = json.dumps(result, ensure_ascii=False)
+        except TypeError as e:
+            # 只窄窄地包这一处的 TypeError,不放进 _db_guard —— 别让宽泛的
+            # except TypeError 顺手吞掉真正的程序 bug
+            raise PersistenceError(
+                f"record_executed_key: result 不可 JSON 序列化: {e}"
+            ) from e
 
         with self._db_guard(f"record_executed_key(key={key})"):
             with self._write_txn() as c:
@@ -243,12 +289,14 @@ class MiniSessionDB:
         - seq 是 session 内自增(不是全局 rowid)。算 seq 和插入必须在同一个
           BEGIN IMMEDIATE 里,否则并发/重跑会算出同一个 seq 撞主键。
         - content 存整条 Message 的 JSON(model_dump_json,能无损 round-trip)。
+        - 顺手把 sessions.updated_at 推进,这样"最近活跃的 session"可查。
         """
         if not session_id:
             raise PersistenceError("append_message: session_id 不能为空")
         if msg.role not in _VALID_ROLES:
             raise PersistenceError(f"append_message: 非法 role={msg.role!r}")
 
+        now = int(time.time())
         with self._db_guard(
             f"append_message(session={session_id}, role={msg.role})",
             hint="(IntegrityError 通常是没先 create_session)",
@@ -264,6 +312,11 @@ class MiniSessionDB:
                 c.execute(
                     "INSERT INTO messages (session_id, seq, role, content, created_at) "
                     "VALUES (?, ?, ?, ?, ?);",
-                    (session_id, seq, msg.role, msg.model_dump_json(), int(time.time())),
+                    (session_id, seq, msg.role, msg.model_dump_json(), now),
+                )
+                # 和 INSERT 同一个事务:要么消息和 updated_at 一起生效,要么都不生效
+                c.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE session_id = ?;",
+                    (now, session_id),
                 )
             return seq

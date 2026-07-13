@@ -142,3 +142,39 @@ class MiniSessionDB:
             return None
         return json.loads(row[0])
 
+    def record_executed_key(self, key: str, session_id: str, result: dict) -> tuple[bool, dict]:
+        """
+        返回 (is_first, canonical_result)。
+        - 用 ON CONFLICT(idempotency_key) DO NOTHING,看 rowcount 判断 is_first。
+        - is_first=True  → canonical 就是你传进来的 result
+        - is_first=False → 你必须把表里那条已存在的 result 读出来返回
+          ★ 关键:这个"读回来"的 SELECT,必须和上面的 INSERT 在同一个
+            BEGIN IMMEDIATE 事务里 —— 想清楚为什么(如果分开,读回来的
+            权威值可能又被第三个并发写者改掉吗?或者说,你能保证读到的
+            就是你 INSERT 时撞上的那一条吗?)
+        """
+        if not isinstance(result,dict):
+            raise PersistenceError("record_executed_key: result应该为字典格式")
+        result_json = json.dumps(result)
+
+        with self._write_txn() as c:
+            cur = c.execute(
+                "INSERT INTO executed_keys "
+                "(idempotency_key, session_id, result, created_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(idempotency_key) DO NOTHING;",
+                (key, session_id, result_json, int(time.time()),),
+            )
+            if cur.rowcount == 1:
+                return True,result
+            elif cur.rowcount == 0:
+                # 将INSERT 和 SELECT 放入同一个事务中，原因：
+                # 1. 少一次锁获取、少一次事务开销。 事务已经开着了,SELECT 顺手就做了
+                # 2. (更重要)不要让代码的正确性,依赖一个"读代码的人看不见的假设"。
+                row = c.execute(
+                    "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
+                ).fetchone()
+                if row is None:
+                    raise PersistenceError(f"executed_keys 不变量被破坏: key={key} 冲突但不存在")
+                return False, json.loads(row[0])
+

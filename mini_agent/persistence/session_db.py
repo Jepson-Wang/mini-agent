@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 
 from persistence.schema import (
@@ -32,4 +33,15 @@ class MiniSessionDB:
         c.execute("PRAGMA foreign_keys=ON;")  # SQLite 默认关!你 messages 有 FK
         c.execute("PRAGMA busy_timeout=5000;")  # 拿不到锁时等 5s 再报 BUSY
         c.execute("PRAGMA synchronous=NORMAL;")  # ← 这个留给你决定
+
+    def create_session(self) -> str:
+        """建一个新 session，返回 sid。append_message 的前置。"""
+        sid = f"sess_{uuid.uuid4().hex[:12]}"
+        now = int(time.time())
+        with self._write_txn() as c:
+            c.execute(
+                "INSERT INTO sessions (session_id,status, created_at, updated_at) "                    
+                "VALUES (?, ?, ?, ?);",(sid, "running", now, now,)
+            )
+        return sid
 

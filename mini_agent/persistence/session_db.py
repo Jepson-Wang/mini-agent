@@ -84,4 +84,33 @@ class MiniSessionDB:
                 (int(time.time()),session_id,)
             )
 
+    def _sanitize_dangling_tool_calls(self, messages: list[Message]) -> list[Message]:
+        """
+        判断一对assistant - tool call 是否是正常结束的
+        正常结束就原样返回，否则就删除这这一对messages
+        """
+        # 第一遍:把所有 tool result 按 tool_call_id 建索引(不管它在哪个位置)
+        results_by_id = {}
+        for msg in messages:
+            if msg.role == "tool":
+                results_by_id[msg.tool_call_id] = msg
+
+        # 第二遍:逐轮认领
+        kept = []
+        for msg in messages:
+            if msg.role == "tool":
+                continue  # tool 消息不单独保留,由所属轮次带出
+
+            if msg.role != "assistant" or not msg.tool_calls:
+                kept.append(msg)  # system/user/纯文本 assistant,天然完整
+                continue
+
+            expected_ids = [tc.id for tc in msg.tool_calls]
+            claimed = [results_by_id.get(tid) for tid in expected_ids]
+
+            if all(r is not None for r in claimed):
+                kept.append(msg)
+                kept.extend(claimed)  # ★ 按 expected_ids 顺序输出,顺便修复乱序
+            # else: 这一轮残缺 → 整轮丢弃(assistant 和它那些孤儿 result 都不进 kept)
+
 

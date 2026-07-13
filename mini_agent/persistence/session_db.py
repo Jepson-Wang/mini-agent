@@ -113,4 +113,4 @@ class MiniSessionDB:
                 kept.extend(claimed)  # ★ 按 expected_ids 顺序输出,顺便修复乱序
             # else: 这一轮残缺 → 整轮丢弃(assistant 和它那些孤儿 result 都不进 kept)
 
-
+        return kept

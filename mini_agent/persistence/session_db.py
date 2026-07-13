@@ -74,4 +74,14 @@ class MiniSessionDB:
         ).fetchone()
         return row is not None
 
+    def end_session(self, session_id) -> None:
+        """
+        __main__.py 正常退出时会调它
+        """
+        with self._write_txn() as c:
+            c.execute(
+                "UPDATE sessions SET status='done',updated_at=? WHERE session_id = ?;",
+                (int(time.time()),session_id,)
+            )
+
 

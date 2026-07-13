@@ -1,9 +1,23 @@
 import ast
 import importlib
+import inspect
 import json
 import threading
 from pathlib import Path
-from typing import Optional, List, Dict, Callable
+from typing import Any, Optional, List, Dict, Callable
+
+from mini_agent.log import get_logger
+
+logger = get_logger(__name__)
+
+
+def _error(message: str) -> str:
+    """工具错误的唯一出口：永远是 {"error": "..."} 形状的合法 JSON 字符串。
+
+    Hermes 的原则：Handlers MUST return a JSON string, errors as {"error": ...},
+    never raised。模型永远收得到能解析的东西。
+    """
+    return json.dumps({"error": message}, ensure_ascii=False)
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -33,27 +47,40 @@ def _module_registers_tools(module_path: Path) -> bool:
     #   但如果registry.register(...)  在一个函数或if中被使用，那么将不会被检测
     return any(_is_registry_register_call(stmt) for stmt in tree.body)
 
-def discover_builtin_tools(path_lib : Optional[Path] = None) -> List[str]:
-    """实现工具自注册"""
-    path = path_lib if path_lib else Path(__file__).resolve().parent
+def discover_builtin_tools(path_lib: Optional[Path] = None) -> List[str]:
+    """扫描 builtin/ 目录，import 所有在顶层调用了 registry.register() 的模块。
+
+    工具的「自注册」靠的是 import 副作用：模块被 import → 顶层的
+    registry.register(...) 执行 → 工具进 _tools。所以这里只需要负责
+    「找到该 import 谁」并 import，不需要关心工具本身。
+
+    返回成功 import 的模块全名列表。
+    """
+    # 扫的是 builtin/ 目录，不是 tools/ 自己 —— 否则会去 import
+    # mini_agent.tools.builtin.registry 这种根本不存在的模块。
+    path = path_lib if path_lib else Path(__file__).resolve().parent / "builtin"
+
     # 动态 import 必须用**包全名**（mini_agent.tools.builtin.xxx），不能用裸名。
     # 裸名要么 import 不到，要么把同一份代码加载成第二个模块对象——那样 @tool
-    # 会注册进两个不同的 _TOOLS 字典，是最难 debug 的一类 bug。
+    # 会注册进两个不同的 _tools 字典，是最难 debug 的一类 bug。
     # 用 __package__（= "mini_agent.tools"）拼，将来改包名也不会坏。
-    module_name = [
+    module_names = [
         f"{__package__}.builtin.{p.stem}"
-        for p in sorted(path.glob('*.py'))
-            if p.name not in {'__init__'}
-            and _module_registers_tools(path)
+        for p in sorted(path.glob("*.py"))
+        if p.name != "__init__.py"
+        and _module_registers_tools(p)   # 传文件，不是目录
     ]
 
     tools = []
-    for mod in module_name:
+    for mod in module_names:
         try:
             importlib.import_module(mod)
             tools.append(mod)
-        except Exception:
-            pass # TODO 导入日志系统
+        except Exception as e:
+            # 绝不能静默吞：一个工具模块 import 失败 = 这个工具直接从模型眼前消失，
+            # 而模型不会告诉你「我少了个工具」，它只会表现得莫名其妙。
+            logger.warning("工具模块导入失败，该工具将不可用: %s (%s: %s)",
+                           mod, type(e).__name__, e)
     return tools
 
 class ToolEntry:
@@ -74,9 +101,11 @@ class ToolEntry:
 class ToolRegistry:
 
     def __init__(self):
-
-        self._tools = Dict[str,ToolEntry] = {}
-        self._toolset_checks = Dict[str,Callable] = {}
+        # 注意是冒号（类型标注），不是等号。
+        # 写成 `self._tools = Dict[str, ToolEntry] = {}` 是**链式赋值**：
+        # Python 会去执行 Dict.__setitem__((str, ToolEntry), {})，运行时直接 TypeError。
+        self._tools: Dict[str, ToolEntry] = {}
+        self._toolset_checks: Dict[str, Callable] = {}
         self._lock = threading.RLock()
 
     def get_entry(self,name: str) -> Optional[ToolEntry]:
@@ -127,18 +156,93 @@ class ToolRegistry:
                 self._toolset_checks.pop(entry.toolset,None)
 
 
-    def dispatch(self,name,args,**kwargs) -> str:
+    def dispatch(self, name: str, args: Optional[dict] = None, **kwargs) -> str:
+        """执行一次工具调用。**永远返回合法 JSON 字符串**，绝不抛异常。
+
+        这是整个工具系统的健壮性契约：模型收到的必须是它能解析的东西。
+        工具炸了就回 {"error": ...}，让模型自己决定重试还是换路子；
+        要是让异常冒到 loop 里，一次 read_file 读不到文件就能把整个 agent 打死。
+
+        调用约定：**args 按具名参数展开**（handler(**args)）。
+        因为 entry.schema 里存的是 JSON Schema，描述的本来就是一组具名参数，
+        模型发来的 arguments 也是 {"path": "a.txt"} 这种形状。所以工具就写成
+        普通的 Python 函数即可：
+
+            def read_file(path: str) -> str: ...
+
+        而不是让每个工具自己去 args["path"] 里掏 —— 那样每个工具都要重写一遍
+        取参 + 校验，还没法用 inspect 自动生成 schema。
+
+        kwargs 是 loop 注入的额外上下文（如 session_id），和 args 合并后一起传。
+        """
         entry = self.get_entry(name)
-        if not entry:
-            return json.dumps({"error":f"Unknow tool:{name}"})
+        if entry is None:
+            return _error(f"Unknown tool: {name}")
+        if entry.handler is None:
+            return _error(f"Tool has no handler: {name}")
+
+        if args is None:
+            args = {}
+        if not isinstance(args, dict):
+            # 模型偶尔会把 arguments 发成字符串或数组
+            return _error(
+                f"Invalid arguments for {name}: expected an object, "
+                f"got {type(args).__name__}"
+            )
+
+        call_args: dict[str, Any] = {**args, **kwargs}
+
+        # 先做参数绑定校验，再执行。这样「模型把参数名写错了」和「工具内部炸了」
+        # 是两类不同的错误，给模型两种不同的提示：前者它改个参数名就能自救，
+        # 后者它得换个思路。混成一句 TypeError 的话，模型只会原地打转。
+        try:
+            inspect.signature(entry.handler).bind(**call_args)
+        except TypeError as e:
+            return _error(f"Invalid arguments for {name}: {e}")
+
         try:
             if entry.is_async:
-                from model_tools import _run_async
-                return _run_async(entry.handler(args,**kwargs))
-            return entry.handler(args,**kwargs)
+                # 延迟 import：model_tools 在顶层 import 了本模块，
+                # 提到文件顶部会变成循环 import。
+                from mini_agent.tools.model_tools import _run_async
+                result = _run_async(entry.handler(**call_args))
+            else:
+                result = entry.handler(**call_args)
         except Exception as e:
-            return json.dumps({"error":"调用工具函数错误"})
+            # 把类型和消息都带上。只回一句"调用工具函数错误"的话，模型看不出
+            # 是文件不存在、权限不够还是磁盘满了，只能瞎猜。
+            logger.warning("工具执行失败: %s(%s) -> %s: %s",
+                           name, call_args, type(e).__name__, e)
+            return _error(f"Tool failed: {name}: {type(e).__name__}: {e}")
+
+        # handler 返回非字符串时兜底序列化，保证「永远是合法 JSON 字符串」成立
+        if isinstance(result, str):
+            return result
+        try:
+            return json.dumps(result, ensure_ascii=False)
+        except TypeError as e:
+            return _error(f"Tool {name} returned a non-JSON-serializable value: {e}")
 
     def _snapshot_state(self) -> tuple[list[ToolEntry],Dict[str,Callable]]:
         with self._lock:
             return list(self._tools.values()),dict(self._toolset_checks)
+
+
+# 全局唯一的注册表实例。工具模块靠 import 副作用自注册：
+#
+#     from mini_agent.tools.registry import registry
+#
+#     def read_file(path: str) -> str: ...
+#
+#     registry.register(                       # ← 必须在模块顶层
+#         name="read_file", toolset="file",
+#         schema={"description": "...", "parameters": {...}},
+#         handler=read_file,
+#     )
+#
+# discover_builtin_tools() 用 AST 找的就是这个顶层 `registry.register(...)` 调用
+# —— 名字必须叫 registry，写成 `from ... import registry as reg` 会扫不到。
+#
+# 这个单例是模块级的，所以「只有一个 _tools 字典」这件事，前提是 registry 模块
+# 本身只有一个模块身份。这正是全项目统一包绝对 import 的意义所在。
+registry = ToolRegistry()

@@ -79,14 +79,15 @@ class Message(BaseModel):
 
     @classmethod
     def from_openai(cls, raw: Any) -> "Message":
-        """从 openai SDK 返回的 message 对象（或等价 dict）构造内部 Message。"""
         if isinstance(raw, dict):
             role = raw.get("role", "assistant")
             content = raw.get("content")
             raw_tcs = raw.get("tool_calls")
-        else:  # openai SDK 对象
+            tool_call_id = raw.get("tool_call_id")  # ← 补
+        else:
             role = raw.role
             content = raw.content
             raw_tcs = getattr(raw, "tool_calls", None)
+            tool_call_id = getattr(raw, "tool_call_id", None)  # ← 补
         tool_calls = [ToolCall.from_openai(tc) for tc in raw_tcs] if raw_tcs else None
-        return cls(role=role, content=content, tool_calls=tool_calls)
+        return cls(role=role, content=content, tool_calls=tool_calls, tool_call_id=tool_call_id)

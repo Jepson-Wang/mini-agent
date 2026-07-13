@@ -1,87 +1,36 @@
+"""同步 → 异步的桥接：让同步的 dispatch 能调用 async 工具 handler。
+
+本项目的主循环是同步的（CLI 单线程），但个别工具可能想写成 async。
+registry.dispatch 在 entry.is_async 时会把 handler(...) 产生的协程交给这里跑完。
+
+设计取舍：不做「按线程缓存事件循环」那套——工具调用不是热路径，每次
+asyncio.run 新建一个 loop 的开销可以忽略，换来的是「绝不出错」的简单。
+"""
+from __future__ import annotations
+
 import asyncio
-import threading
-from typing import Optional
-from mini_agent.tools.registry import discover_builtin_tools
+import concurrent.futures
+from typing import Any, Coroutine
 
-_tool_loop = None
-_tool_thread_local = threading.local()
-_tool_lock = threading.Lock()
 
-def _get_tool_loop():
-    global _tool_loop
-    with _tool_lock:
-        if _tool_loop is None or _tool_loop.is_closed:
-            _tool_loop = asyncio.new_event_loop()
-        return _tool_loop
+def _run_async(coro: Coroutine) -> Any:
+    """把一个协程跑到完成并返回它的结果。
 
-def _get_worker_loop():
-    loop = getattr(_tool_thread_local,'loop',None)
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    return loop
-
-discover_builtin_tools()
-
-def _run_async(fn):
-    """
-    执行异步任务
+    两种情形：
+    - 当前线程没有正在运行的事件循环（CLI 主线程的常态）→ asyncio.run 直接跑。
+    - 当前线程**已经**有 loop 在跑（我们是同步架构，正常不会发生，但防一手）→
+      不能在运行中的 loop 里再 asyncio.run（会 RuntimeError），只能把协程丢到
+      一个临时工作线程里，让它在自己干净的 loop 上跑完。
     """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()
     except RuntimeError:
-        loop = None
+        running = False
+    else:
+        running = True
 
-    # 分支一: 如果loop存在并且在跑，此时需要创建一个一次性线程来跑
-    if loop and loop.is_running():
-        import concurrent.futures
+    if not running:
+        return asyncio.run(coro)
 
-        worker_loop : Optional[asyncio.AbstractEventLoop] = None
-        event = threading.Event()
-
-        def _worker():
-            """
-            获取worker_loop并执行相关代码并返回
-            """
-            nonlocal worker_loop
-            worker_loop = asyncio.get_event_loop()
-            event.set()
-            try:
-                asyncio.set_event_loop(worker_loop)
-                return worker_loop.run_until_complete(fn)
-            finally:
-                try:
-                    pending = asyncio.all_tasks()
-                    for t in pending:
-                        t.cancel()
-                    if pending:
-                        worker_loop.run_until_complete(
-                            asyncio.gather(*pending, return_exceptions=True)
-                        )
-                except Exception:
-                    pass
-                worker_loop.close()
-
-        worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = worker.submit(_worker)
-        try:
-            future.result()
-        except concurrent.futures.TimeoutError:
-            try:
-                for t in asyncio.all_tasks(worker_loop):
-                    worker_loop.call_soon_threadsafe(t.cancel)
-            except RuntimeError:
-                pass
-
-        finally:
-            worker.shutdown(wait = False)
-
-    # 分支二: 如果此时在一个线程中跑，但是这个线程不是主线程，那么就获取worker_loop并执行
-    if threading.current_thread() is not threading.main_thread():
-        loop = _get_worker_loop()
-        return loop.run_until_complete(fn)
-
-    # 分支三: 如果此时在主线程跑，那么就直接拿一个tool_loop并执行fn
-    loop = _get_tool_loop()
-    return loop.run_until_complete(fn)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()

@@ -64,4 +64,14 @@ class MiniSessionDB:
             c.execute(MESSAGES_CREATE_SQL)
             c.execute(EXECUTED_KEYS_CREATE_SQL)
 
+    def session_exists(self, session_id) -> bool:
+        """
+        用户 - -resume sess_xxx 时先校验，不存在就早报错
+        """
+        c = self.conn
+        row = c.execute(
+            "SELECT 1 FROM sessions WHERE session_id=? LIMIT 1;",(session_id,)
+        ).fetchone()
+        return row is not None
+
 

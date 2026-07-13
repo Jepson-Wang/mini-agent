@@ -129,3 +129,16 @@ class MiniSessionDB:
         messages = self._sanitize_dangling_tool_calls(messages)
         return messages
 
+    # 幂等表的相关操作，两个方法分别用于获取tool结果和记录tool结果
+
+    def get_executed_result(self, key: str) -> dict | None:
+        """查幂等缓存。命中返回 result dict,未命中返回 None。纯读,不开写事务。"""
+        if not key:
+            raise PersistenceError("get_executed_result: key 不能为空")
+        row = self.conn.execute(
+            "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+

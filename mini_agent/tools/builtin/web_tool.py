@@ -190,53 +190,56 @@ def _web_enabled() -> bool:
 # handler
 # ---------------------------------------------------------------------------
 
+def _err(message: str) -> str:
+    """web 工具的错误出口：永远是 {"error": ...} 的合法 JSON 字符串。"""
+    return json.dumps({"error": message}, ensure_ascii=False)
+
+
+def _guarded_get(
+    url: str, max_bytes: int, user_agent: str = USER_AGENT
+) -> tuple[str, int, str, bytes, bool]:
+    """过完四道闸做一次 GET，返回 (最终URL, 状态码, Content-Type, 原始字节, 是否截断)。
+
+    web_fetch 和 web_search 共用这段：闸 1+2 在 _check_url，闸 3 在 _opener 的重定向
+    复检，闸 4 是这里只读 max_bytes+1 字节。策略拒绝抛 WebToolError，网络错误抛
+    urllib/socket 异常，都留给调用方转成 {"error": ...}。
+    """
+    _check_url(url)                                    # 闸 1 + 闸 2
+    req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+    with _opener.open(req, timeout=TIMEOUT_SECONDS) as resp:   # 闸 3 在此生效
+        status = resp.status
+        final_url = resp.url                           # 重定向后的最终地址
+        content_type = resp.headers.get("Content-Type", "")
+        raw = resp.read(max_bytes + 1)                 # 闸 4：多读 1 字节判断截断
+    truncated = len(raw) > max_bytes
+    return final_url, status, content_type, raw[:max_bytes], truncated
+
+
 def web_fetch(url: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
     """抓取 url，返回正文文本（JSON 字符串）。
 
-    handler 的契约：**永远返回 JSON 字符串，绝不把异常抛给模型看**。这里把可预期
-    的失败（策略拒绝、HTTP 4xx/5xx、超时）都转成 {"error": ...}，并带上足够模型
-    自己判断「该重试还是该换个 url」的信息。意料之外的异常就让它冒出去——
-    registry.dispatch 会兜底包成 JSON（这就是两层包裹）。
+    handler 的契约：**永远返回 JSON 字符串，绝不把异常抛给模型看**。可预期的失败
+    （策略拒绝、HTTP 4xx/5xx、超时）都转成 {"error": ...}，带上足够模型判断
+    「该重试还是换个 url」的信息。意料之外的异常冒出去，由 dispatch 兜底。
     """
     max_chars = max(1, min(int(max_chars), DEFAULT_MAX_CHARS * 4))
 
     try:
-        _check_url(url)                                    # 闸 1 + 闸 2
-    except WebToolError as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with _opener.open(req, timeout=TIMEOUT_SECONDS) as resp:   # 闸 3 在这里生效
-            status = resp.status
-            final_url = resp.url                           # 重定向后的最终地址
-            content_type = resp.headers.get("Content-Type", "")
-            # 闸 4：只读 MAX_BYTES+1，多出的那 1 字节用来判断「是不是被截断了」。
-            # 不看 Content-Length——那是服务器说的，可以撒谎。
-            raw = resp.read(MAX_BYTES + 1)
+        final_url, status, content_type, raw, body_truncated = _guarded_get(url, MAX_BYTES)
+    except WebToolError as e:                          # scheme / 内网 / 重定向被拒
+        return _err(str(e))
     except urllib.error.HTTPError as e:
-        return json.dumps(
-            {"error": f"HTTP {e.code} {e.reason}", "url": url}, ensure_ascii=False
-        )
-    except WebToolError as e:                              # 重定向到了内网
-        return json.dumps({"error": f"重定向被拒绝: {e}"}, ensure_ascii=False)
+        return json.dumps({"error": f"HTTP {e.code} {e.reason}", "url": url}, ensure_ascii=False)
     except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
         return json.dumps(
-            {"error": f"请求失败: {type(e).__name__}: {e}", "url": url},
-            ensure_ascii=False,
+            {"error": f"请求失败: {type(e).__name__}: {e}", "url": url}, ensure_ascii=False
         )
-
-    body_truncated = len(raw) > MAX_BYTES
-    raw = raw[:MAX_BYTES]
 
     if not _looks_textual(content_type):
         # 二进制内容（图片 / PDF / 压缩包）没必要塞给模型，回一条元信息让它换路子
         return json.dumps(
-            {
-                "error": f"不是文本内容: Content-Type={content_type!r}，未读取正文",
-                "url": final_url,
-                "status": status,
-            },
+            {"error": f"不是文本内容: Content-Type={content_type!r}，未读取正文",
+             "url": final_url, "status": status},
             ensure_ascii=False,
         )
 
@@ -249,16 +252,111 @@ def web_fetch(url: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
 
     return json.dumps(
         {
-            # 给最终地址而不是原始 url：模型该知道自己被重定向了
-            "url": final_url,
+            "url": final_url,          # 最终地址：让模型知道自己被重定向了
             "status": status,
             "content_type": content_type,
-            # 明确告诉模型「后面还有」，别把残篇当全文
-            "truncated": truncated,
+            "truncated": truncated,    # 明确告诉模型「后面还有」，别把残篇当全文
             "chars": len(text),
             "text": text,
         },
         ensure_ascii=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# web_search：DuckDuckGo（免 key）
+# ---------------------------------------------------------------------------
+# DDG 的 html 端点 https://html.duckduckgo.com/html/?q=... 返回一页 HTML，
+# 每条结果是 <a class="result__a" href="...">标题</a> + <a class="result__snippet">。
+# href 常被包成 //duckduckgo.com/l/?uddg=<真实URL的百分号编码>，要解出来。
+# 注意：这是非官方接口，会被限流、结构也可能变——学习够用，别当生产依赖。
+
+# 用一个像浏览器的 UA，否则 DDG 常返回空页/挑战页而不是结果。
+_SEARCH_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+)
+
+
+def _decode_ddg_href(href: str) -> str:
+    """把 DDG 的跳转链接 //duckduckgo.com/l/?uddg=<编码URL> 解回真实 URL。"""
+    if href.startswith("//"):
+        href = "https:" + href
+    qs = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+    if "uddg" in qs:
+        return qs["uddg"][0]
+    return href
+
+
+class _DuckDuckGoParser(HTMLParser):
+    """从 DDG html 结果页抽出 [{title, url, snippet}, ...]。
+
+    结果标题和摘要是两个相邻的 <a>，各带一个 class。命中 result__a 就新开一条记录、
+    顺手解出真实 url；命中 result__snippet 就往最近那条上补摘要；到 </a> 收尾。
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.results: list[dict] = []
+        self._mode: str | None = None      # "title" | "snippet" | None
+        self._buf: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        a = dict(attrs)
+        cls = a.get("class") or ""
+        if "result__a" in cls:
+            self.results.append(
+                {"title": "", "url": _decode_ddg_href(a.get("href") or ""), "snippet": ""}
+            )
+            self._mode, self._buf = "title", []
+        elif "result__snippet" in cls:
+            self._mode, self._buf = "snippet", []
+
+    def handle_data(self, data):
+        if self._mode:
+            self._buf.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._mode and self.results:
+            self.results[-1][self._mode] = "".join(self._buf).strip()
+            self._mode, self._buf = None, []
+
+
+def web_search(query: str, max_results: int = 5) -> str:
+    """用 DuckDuckGo 搜索 query，返回排名靠前的结果（标题 + URL + 摘要）。
+
+    只打 DDG 这一个固定的公网地址，模型无法把它指向内网——所以这个工具不像
+    web_fetch 那样受 ALLOW_WEB 门控，开箱即用。
+    """
+    max_results = max(1, min(int(max_results), 10))
+    ddg_url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
+
+    try:
+        _, _, content_type, raw, _ = _guarded_get(ddg_url, MAX_BYTES, _SEARCH_USER_AGENT)
+    except WebToolError as e:
+        return _err(str(e))
+    except urllib.error.HTTPError as e:
+        return _err(f"搜索失败: HTTP {e.code} {e.reason}")
+    except (urllib.error.URLError, socket.timeout, TimeoutError) as e:
+        return _err(f"搜索请求失败: {type(e).__name__}: {e}")
+
+    parser = _DuckDuckGoParser()
+    try:
+        parser.feed(raw.decode(_charset_of(content_type), errors="replace"))
+    except Exception:
+        logger.warning("DuckDuckGo 结果解析中断，返回已抽取的部分")
+
+    results = [r for r in parser.results if r["url"] and r["title"]][:max_results]
+    if not results:
+        return json.dumps(
+            {"query": query, "count": 0, "results": [],
+             "note": "没有解析到结果——可能被 DDG 限流，或页面结构变了"},
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {"query": query, "count": len(results), "results": results}, ensure_ascii=False
     )
 
 
@@ -297,4 +395,39 @@ registry.register(
     check_fn=_web_enabled,
     is_async=False,
     description=WEB_FETCH_SCHEMA["description"],
+)
+
+
+WEB_SEARCH_SCHEMA = {
+    "name": "web_search",
+    "description": (
+        "用 DuckDuckGo 搜索关键词，返回排名靠前的网页（标题、URL、摘要）。"
+        "需要「查一下」「搜一下」「今天的新闻」这类信息时用它；"
+        "拿到某个具体 URL 后再想读全文，用 web_fetch。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "搜索关键词",
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "返回结果条数，默认 5，最多 10",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
+# 注意：web_search 不传 check_fn —— 它只打 DDG 一个固定公网地址，没有 SSRF 面，
+# 所以不受 ALLOW_WEB 门控，开箱即用（web_fetch 能抓任意 URL，才需要门控）。
+registry.register(
+    name="web_search",
+    toolset="web",
+    schema=WEB_SEARCH_SCHEMA,
+    handler=web_search,
+    is_async=False,
+    description=WEB_SEARCH_SCHEMA["description"],
 )

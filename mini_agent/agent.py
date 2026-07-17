@@ -24,7 +24,11 @@ if TYPE_CHECKING:
     from mini_agent.persistence.session_db import MiniSessionDB
 
 DEFAULT_SYSTEM_PROMPT = (
-    "You are mini-agent, a helpful AI assistant. "
+    "You are mini-agent, a helpful AI assistant with access to tools.\n"
+    "When a task needs external information or an action, CALL the appropriate tool "
+    "immediately. Do NOT announce what you are about to do or ask the user to wait — "
+    "just call the tool, then answer from its result.\n"
+    "When you used a web tool, cite the source URLs you relied on.\n"
     "Answer concisely and accurately."
 )
 

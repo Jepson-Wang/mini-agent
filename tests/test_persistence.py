@@ -16,7 +16,11 @@ import time
 
 import pytest
 
-from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
+from mini_agent.persistence.session_db import (
+    _INTERRUPTED,
+    MiniSessionDB,
+    PersistenceError,
+)
 from mini_agent.schema import Message, ToolCall
 
 
@@ -164,11 +168,14 @@ def test_recover_empty_session_returns_empty_list(db):
     assert db.recover(db.create_session()) == []
 
 
-def test_recover_drops_dangling_tool_call(db, db_path):
+def test_recover_stubs_dangling_tool_call(db, db_path):
     """崩在「assistant 已落库、tool 结果还没落库」的瞬间。
 
     这是崩溃恢复里唯一真正危险的状态：直接把这段历史发给 DeepSeek 会 400
-    （tool_use 后面必须紧跟数量匹配的 tool_result）。所以整轮必须丢掉。
+    （tool_use 后面必须紧跟数量匹配的 tool_result）。
+    但**不能丢**这一轮 —— 丢掉 = 抹掉「工具可能已经跑过」这个事实，模型看不见
+    就会重做一遍（邮件重发、文件重写）。正确解法是补一条 interrupted 桩：
+    配对补齐（不 400），同时如实告诉模型「这次调用结果未知」，让它自己决定重试。
     """
     sid = db.create_session()
     db.append_message(sid, Message(role="user", content="帮我读 a.txt"))
@@ -177,31 +184,40 @@ def test_recover_drops_dangling_tool_call(db, db_path):
 
     revived = MiniSessionDB(db_path).recover(sid)
 
-    assert [m.role for m in revived] == ["user"]
-    assert not any(m.tool_calls for m in revived)
+    assert [m.role for m in revived] == ["user", "assistant", "tool"]
+    # 桩必须认领它的 assistant，否则配对不上，补了等于没补
+    assert revived[2].tool_call_id == "call_1"
+    assert revived[2].content == _INTERRUPTED
 
 
-def test_recover_drops_only_the_incomplete_round(db, db_path):
-    """一轮残缺不该连累另一轮完整的：完整的留下，残缺的丢掉。"""
+def test_recover_stubs_only_the_incomplete_round(db, db_path):
+    """一轮残缺不该连累另一轮完整的：完整的原样带出，只有残缺的那轮补桩。"""
     sid = db.create_session()
     db.append_message(sid, Message(role="user", content="q1"))
     db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
     db.append_message(sid, Message(role="tool", tool_call_id="call_1", content="r1"))
     db.append_message(sid, Message(role="user", content="q2"))
     db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_2")]))
-    # call_2 的结果没落库 → 只有第二轮该被丢
+    # call_2 的结果没落库 → 只有第二轮该补桩
 
     revived = MiniSessionDB(db_path).recover(sid)
 
-    assert [m.role for m in revived] == ["user", "assistant", "tool", "user"]
+    assert [m.role for m in revived] == [
+        "user", "assistant", "tool", "user", "assistant", "tool",
+    ]
+    # 第一轮完全没被动过：真结果就是真结果，绝不能被桩覆盖
     assert revived[1].tool_calls[0].id == "call_1"
+    assert revived[2].content == "r1"
+    # 第二轮补了桩
+    assert revived[5].tool_call_id == "call_2"
+    assert revived[5].content == _INTERRUPTED
 
 
-def test_recover_partial_multi_tool_round_is_dropped_whole(db, db_path):
-    """一个 assistant 发起两个 tool_call，只回来一个结果 → 整轮丢弃。
+def test_recover_stubs_only_the_missing_call_in_a_multi_tool_round(db, db_path):
+    """一个 assistant 发起两个 tool_call，只回来一个结果 → 只补缺的那个。
 
-    不能只丢那个缺结果的 tool_call、留下另一个：配对规则要求「数量一致」，
-    留半轮照样 400。
+    配对规则要求「数量一致」，所以两个 tool_call 必须都有对应的 tool 消息；
+    但已经拿到的那个真结果要原样保留 —— 它代表已经发生的副作用。
     """
     sid = db.create_session()
     db.append_message(sid, Message(role="user", content="读两个文件"))
@@ -213,7 +229,49 @@ def test_recover_partial_multi_tool_round_is_dropped_whole(db, db_path):
 
     revived = MiniSessionDB(db_path).recover(sid)
 
-    assert [m.role for m in revived] == ["user"]
+    assert [m.role for m in revived] == ["user", "assistant", "tool", "tool"]
+    assert (revived[2].tool_call_id, revived[2].content) == ("c1", "r1")
+    assert (revived[3].tool_call_id, revived[3].content) == ("c2", _INTERRUPTED)
+
+
+def test_recover_backfills_missing_result_from_idempotency_table(db, db_path):
+    """幂等表存在的全部意义，就是这个测试。
+
+    三个写入点是有先后的：
+        handler() 跑完 ──► record_executed_key ──► append_message(tool 结果)
+                              ②                          ③
+    崩在 ②③ 之间时，工具**真的跑过了**、结果**真的存下来了**，只是没进 messages。
+    这时补 interrupted 桩就是在撒谎，会害模型白白重跑一次有副作用的操作。
+    所以补桩前必须先查幂等表：查得到 → 无损恢复出真结果，一次都不用重跑。
+    """
+    sid = db.create_session()
+    db.append_message(sid, Message(role="user", content="发封邮件"))
+    db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
+    # 工具跑完了、幂等表也写了，但进程在 append_message 之前就死了
+    db.record_executed_key("call_1", sid, {"content": "邮件已发送"})
+
+    revived = MiniSessionDB(db_path).recover(sid)
+
+    assert [m.role for m in revived] == ["user", "assistant", "tool"]
+    assert revived[2].tool_call_id == "call_1"
+    assert revived[2].content == "邮件已发送"      # ← 真结果，不是桩
+    assert revived[2].content != _INTERRUPTED
+
+
+def test_recover_stubs_when_idempotency_table_has_no_matching_key(db, db_path):
+    """幂等表里有别的 key，但没有这个 tool_call 的 → 照样补桩。
+
+    和上一个测试配成一对：证明补桩走的是 **按 tool_call_id 精确查表**，
+    而不是「表里有行就当命中」。少了这个测试，一个把 key 写错的实现也能跑绿。
+    """
+    sid = db.create_session()
+    db.append_message(sid, Message(role="user", content="发封邮件"))
+    db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
+    db.record_executed_key("call_999", sid, {"content": "别人的结果"})  # 不相干的 key
+
+    revived = MiniSessionDB(db_path).recover(sid)
+
+    assert revived[2].content == _INTERRUPTED
 
 
 def test_recover_skips_one_corrupt_row(db, db_path):

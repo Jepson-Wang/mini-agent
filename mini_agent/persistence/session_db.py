@@ -24,6 +24,12 @@ class PersistenceError(Exception):
 
 _VALID_ROLES = {"system", "user", "assistant", "tool"}
 
+# 崩在"tool 结果没落库"的瞬间、且幂等表里也没有真结果时,用它补桩。
+_INTERRUPTED = json.dumps(
+    {"error": "interrupted: 上次运行崩溃，这个工具调用的结果未知"},
+    ensure_ascii=False,
+)
+
 
 class MiniSessionDB:
 
@@ -150,9 +156,20 @@ class MiniSessionDB:
     # ---------- 崩溃恢复 ----------
 
     def _sanitize_dangling_tool_calls(self, messages: list[Message]) -> list[Message]:
-        """
-        判断一对assistant - tool call 是否是正常结束的
-        正常结束就原样返回，否则就删除这这一对messages
+        """把每一轮 assistant(tool_calls) 补足成配对完整、可安全发给 DeepSeek 的形状。
+
+        不变量:在【串行】主循环里,_execute_tool_calls 会把一轮的 N 个 tool 结果
+        全部落库后才回到循环顶去取下一个 assistant。所以一个残缺的轮次后面不可能
+        再挂消息 —— 悬空【至多一个,且必然在尾部】。
+
+        那为什么还遍历所有轮、而不是只查最后一个 assistant?
+        防御:M4 子代理 / M6 并行只读工具将来会引入【乱序回填】,一旦上面的不变量
+        被打破,只查尾部就会静默产出一个 400 的 transcript。遍历所有轮的成本可忽略
+        (complete 轮走 fast path,只是 dict 查一下),换来的是不依赖这个不变量。
+
+        补桩而非丢弃:残缺轮里已经落库的真实结果代表【已经发生的副作用】(邮件已发、
+        文件已写),丢掉它 = 恢复后模型不知情、必重做。所以整轮保留,缺失的位置
+        先查幂等表拿真结果,查不到才用 _INTERRUPTED 桩占位。
         """
         # 第一遍:把所有 tool result 按 tool_call_id 建索引(不管它在哪个位置)
         results_by_id = {}
@@ -170,18 +187,27 @@ class MiniSessionDB:
                 kept.append(msg)  # system/user/纯文本 assistant,天然完整
                 continue
 
-            expected_ids = [tc.id for tc in msg.tool_calls]
-            claimed = [results_by_id.get(tid) for tid in expected_ids]
+            kept.append(msg)
 
-            if all(r is not None for r in claimed):
-                kept.append(msg)
-                kept.extend(claimed)  # ★ 按 expected_ids 顺序输出,顺便修复乱序
-            else:
-                # 这一轮残缺(崩在"assistant 已落库、tool 结果没落库"的瞬间)
-                # → 整轮丢弃,否则发给 DeepSeek 必 400
-                logger.warning(
-                    "recover: 丢弃残缺的一轮 tool 调用, tool_call_ids=%s", expected_ids
-                )
+            for tc in msg.tool_calls:
+                r = results_by_id.get(tc.id)
+                if r is not None:
+                    kept.append(r)  # 真结果,原样带出(顺便按 tool_calls 顺序修复乱序)
+                    continue
+
+                # 结果没落库 → 先看幂等表里有没有 handler 真跑出来的结果。
+                # 命中说明崩在"已 record_executed_key、还没 append_message"之间,
+                # 这一步是无损恢复;未命中才是真丢了。
+                cached = self.get_executed_result(tc.id)
+                content = cached.get("content") if isinstance(cached, dict) else None
+                if content is not None:
+                    logger.warning("recover: tc=%s 用幂等表里的真结果补回", tc.id)
+                else:
+                    content = _INTERRUPTED
+                    logger.warning("recover: tc=%s 结果丢失,补 interrupted 桩", tc.id)
+
+                # 补出来的这条必须和真结果长得一模一样,否则照样 400
+                kept.append(Message(role="tool", tool_call_id=tc.id, content=content))
 
         return kept
 

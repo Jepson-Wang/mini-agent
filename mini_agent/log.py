@@ -11,10 +11,14 @@
 - **幂等初始化**：`_setup()` 用一个模块级标志位保证只配置一次，import 多次也安全。
 - **双 handler**：控制台（给人看，简洁）+ 滚动文件（留证据，带时间/位置，
   `RotatingFileHandler` 防止无限增长）。
-- 全部配置走**环境变量**，不侵入 config.py：
+- 日志自身的行为全部走**环境变量**，不往 Settings 里塞日志字段：
   - `MINI_AGENT_LOG_LEVEL`   日志级别，默认 INFO（DEBUG/INFO/WARNING/ERROR）
-  - `MINI_AGENT_LOG_DIR`     日志目录，默认 ~/.mini_agent/logs
+  - `MINI_AGENT_LOG_DIR`     日志目录，默认 `settings.home / "logs"`
   - `MINI_AGENT_LOG_CONSOLE` 是否打到控制台，默认 1（设 0 关闭，跑测试时有用）
+  唯一从 config 拿的东西是 `settings.home`——「状态放哪」是全局决策，
+  必须单点定义，不能让 log.py 和 __main__.py 各自硬编码一遍路径。
+  （依赖方向：log → config。config 不 import 项目内任何模块，所以不成环；
+   这条规矩要守住，否则哪天 config 想打条日志就死锁在 import 上。）
 """
 from __future__ import annotations
 
@@ -22,6 +26,8 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+from mini_agent.config import settings
 
 # 整个项目共用的根 logger 名字；所有子 logger 都是它的后代
 ROOT_LOGGER_NAME = "mini_agent"
@@ -46,9 +52,9 @@ def _resolve_level() -> int:
 
 
 def _resolve_log_dir() -> Path:
-    """日志目录，默认与 state.db 同在 ~/.mini_agent 下。目录不存在则创建。"""
-    default = Path.home() / ".mini_agent" / "logs"
-    log_dir = Path(os.getenv("MINI_AGENT_LOG_DIR", str(default)))
+    """日志目录，默认与 state.db 同在 settings.home 下。目录不存在则创建。"""
+    default = settings.home / "logs"
+    log_dir = Path(os.getenv("MINI_AGENT_LOG_DIR", str(default))).expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
     return log_dir
 

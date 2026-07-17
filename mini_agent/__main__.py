@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from mini_agent.agent import Agent
 from mini_agent.config import settings
@@ -24,10 +23,9 @@ DEFAULT_TOOLSET = {"file", "web"}
 
 
 def _db_path() -> str:
-    """~/.mini_agent/state.db；目录不存在先建。"""
-    home = Path.home() / ".mini_agent"
-    home.mkdir(parents=True, exist_ok=True)
-    return str(home / "state.db")
+    """<settings.home>/state.db；目录不存在先建。默认落在项目根的 .mini_agent/。"""
+    settings.home.mkdir(parents=True, exist_ok=True)
+    return str(settings.home / "state.db")
 
 
 def _parse_resume(argv: list[str]) -> str | None:

@@ -24,6 +24,11 @@ class PersistenceError(Exception):
 
 _VALID_ROLES = {"system", "user", "assistant", "tool"}
 
+_INTERRUPTED = json.dumps(
+      {"error": "interrupted: 上次运行崩溃，这个工具调用的结果未知"},
+      ensure_ascii=False,
+  )
+
 
 class MiniSessionDB:
 
@@ -170,18 +175,22 @@ class MiniSessionDB:
                 kept.append(msg)  # system/user/纯文本 assistant,天然完整
                 continue
 
-            expected_ids = [tc.id for tc in msg.tool_calls]
-            claimed = [results_by_id.get(tid) for tid in expected_ids]
+            kept.append(msg)
 
-            if all(r is not None for r in claimed):
-                kept.append(msg)
-                kept.extend(claimed)  # ★ 按 expected_ids 顺序输出,顺便修复乱序
-            else:
-                # 这一轮残缺(崩在"assistant 已落库、tool 结果没落库"的瞬间)
-                # → 整轮丢弃,否则发给 DeepSeek 必 400
-                logger.warning(
-                    "recover: 丢弃残缺的一轮 tool 调用, tool_call_ids=%s", expected_ids
-                )
+            # 执行策略：遍历所有assistant-tool对
+            # 先获取assistant所需要的id，再去判断是否存在
+            for tc in msg.tool_calls:
+                r = results_by_id.get(tc.id)
+                if r is not None:
+                    kept.append(r)
+                    continue
+                cached = self.get_executed_result(tc.id)
+                if cached is not None and isinstance(cached,dict):
+                    content = cached.get(content)
+                else:
+                    content = _INTERRUPTED
+                # 然后将content给写入到
+                kept.append(content)
 
         return kept
 
@@ -194,6 +203,11 @@ class MiniSessionDB:
         容错:单行 content 损坏(JSON 坏了 / schema 对不上)时,跳过这一行并告警,
         而不是让整个 --resume 崩掉 —— 崩溃恢复本身就不该被一行脏数据打死。
         """
+        # recover 这个函数应该做如下改动，以便应用上幂等表，并减少用户使用成本
+        # 1. 将幂等表接入，具体应该是：先判断一个assistant-tool对是否是完整的，完整的话，那就直接跳过，，否则就进行重跑
+        # 2. 此外，重跑的那个assistant-tool 应该是最末尾的那一对，否则前面的messages加到哪
+        # 但实际上不应该重跑，因为这个跑的是一个assistant和tool 对，已经有了assistant，此时再去跑LLM没任何作用
+        # 所以应该调用handler来跑tools并传入，所以主要应该改_sanitize_dangling_tool_calls这个函数
         with self._db_guard(f"recover(session={session_id})"):
             rows = self.conn.execute(
                 "SELECT seq, content FROM messages WHERE session_id = ? ORDER BY seq;",

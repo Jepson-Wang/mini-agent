@@ -152,17 +152,18 @@ def test_dispatch_survives_uninspectable_handler(isolated_registry, monkeypatch)
 # ---------------------------------------------------------------------------
 
 def test_get_definitions_filters_by_toolset_and_is_sorted(isolated_registry):
-    isolated_registry.register(name="z_tool", toolset="file",
+    # 用测试专属的 toolset 名，避免和真实内置工具（file/web 集）撞在一起
+    isolated_registry.register(name="z_tool", toolset="ftest",
                                schema={"description": "z", "parameters": {}}, handler=lambda: "")
-    isolated_registry.register(name="a_tool", toolset="file",
+    isolated_registry.register(name="a_tool", toolset="ftest",
                                schema={"description": "a", "parameters": {}}, handler=lambda: "")
-    isolated_registry.register(name="other", toolset="web",
+    isolated_registry.register(name="other", toolset="wtest",
                                schema={"description": "o", "parameters": {}}, handler=lambda: "")
 
-    defs = isolated_registry.get_definitions(toolset={"file"})
+    defs = isolated_registry.get_definitions(toolset={"ftest"})
     names = [d["function"]["name"] for d in defs]
 
-    assert names == ["a_tool", "z_tool"]         # 只剩 file 集，且按名排序（缓存友好）
+    assert names == ["a_tool", "z_tool"]         # 只剩 ftest 集，且按名排序（缓存友好）
     assert defs[0]["type"] == "function"          # DeepSeek/OpenAI 形状
 
 

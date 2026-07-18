@@ -52,11 +52,11 @@ def main() -> None:
         if not db.session_exists(resume_sid):
             print(f"会话不存在: {resume_sid}", file=sys.stderr)
             sys.exit(1)
-        agent = Agent(session_id=resume_sid, db=db, toolset=DEFAULT_TOOLSET,
-                      max_turns=settings.max_turns)
-        agent.messages = db.recover(resume_sid)   # 从库里重建历史（已清理悬空 tool_calls）
         session_id = resume_sid
-        print(f"恢复会话 {session_id}（{len(agent.messages)} 条历史）")
+        history = db.recover(resume_sid)   # 从库里重建历史（残缺轮已补桩，可安全续跑）
+        agent = Agent(session_id=session_id, db=db, toolset=DEFAULT_TOOLSET,
+                      max_turns=settings.max_turns, initial_messages=history)
+        print(f"恢复会话 {session_id}（{len(history)} 条历史）")
     else:
         session_id = db.create_session()
         agent = Agent(session_id=session_id, db=db, toolset=DEFAULT_TOOLSET,

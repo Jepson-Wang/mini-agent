@@ -249,3 +249,38 @@ def test_agent_persists_full_transcript(isolated_registry, fake_llm, tmp_path):
     assert revived[1].tool_calls[0].name == "echo"
     assert json.loads(revived[2].content) == {"echoed": "hi"}
     assert revived[3].content == "done"
+
+
+def test_initial_messages_seed_memory_without_rewriting_history(tmp_path):
+    """--resume 接线：initial_messages 只播种内存，绝不能把历史重新写一遍库。
+
+    recover 出来的消息本就是从库里读的。如果构造器拿它们走 _record，messages 表
+    会被整段历史重写一遍——seq 从 MAX+1 续着涨，行数翻倍，历史彻底乱套。所以
+    initial_messages 必须是直接赋值、不落库。这个测试就守着这条边界。
+    """
+    from mini_agent.persistence.session_db import MiniSessionDB
+
+    db_file = str(tmp_path / "state.db")
+    db = MiniSessionDB(db_file)
+    sid = db.create_session()
+    db.append_message(sid, Message(role="user", content="q1"))
+    db.append_message(sid, Message(role="assistant", content="a1"))
+
+    before = db.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?;", (sid,)
+    ).fetchone()[0]
+
+    history = db.recover(sid)
+    agent = Agent(session_id=sid, db=db, initial_messages=history)
+
+    # 播种进了内存
+    assert [m.role for m in agent.messages] == ["user", "assistant"]
+    # 但库里一条都没多——构造器没有重新落库
+    after = db.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?;", (sid,)
+    ).fetchone()[0]
+    assert before == after == 2
+
+    # 且拷了一份：改 agent.messages 不会反噬调用方传进来的 history
+    agent.messages.append(Message(role="user", content="q2"))
+    assert len(history) == 2

@@ -70,6 +70,7 @@ class Agent:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_turns: int = 25,
         depth: int = 0,
+        initial_messages: Optional[list[Message]] = None,
     ):
         # M2：session_id + db 同时给才开启持久化。两者缺一即纯内存模式
         #     （M0 测试、一次性调用都走这条），行为与最初完全一致。
@@ -81,7 +82,12 @@ class Agent:
         self.system_prompt = system_prompt
         self.max_turns = max_turns
         self.depth = depth                    # M4 递归深度，M1/M2 恒为 0
-        self.messages: list[Message] = []     # 不含 system；system 在发送时拼接
+        # 不含 system；system 在发送时拼接。
+        # M2 --resume：initial_messages 是 db.recover() 出来的历史，用来播种内存。
+        #   ★ 直接赋值、绝不走 _record —— 这些消息本就是从库里读出来的，再 _record
+        #     一遍会把整段历史重新写进 messages 表（seq 撞主键 / 行数翻倍）。
+        #   list(...) 拷一份，避免和调用方的 list 别名共享。
+        self.messages: list[Message] = list(initial_messages) if initial_messages else []
 
         if toolset:
             # 显式、幂等地做一次工具发现：一个"带工具的 agent"就该保证工具已注册。
@@ -124,10 +130,17 @@ class Agent:
         ★ 配对铁律：带 tool_calls 的 assistant 后面，必须紧跟"数量一致、
         tool_call_id 一一对应"的 tool 消息，否则下一次请求会 400。串行执行、
         每个 tc 都回填一条，天然满足；关键是**一个都不能漏**。
-        dispatch 保证永远返回合法 JSON 字符串，所以这里不会抛。
+
+        ★ 写入顺序（②在③前）：先记幂等表、再落 tool 结果。若崩在这两步之间，
+        recover 能按 tool_call_id 从幂等表查回真结果补桩，不必重跑有副作用的工具。
+        result 包成 {"content": result} 是因为 dispatch 返回的是裸字符串（不一定是
+        JSON），而幂等表按 dict 存、recover 按 cached["content"] 取——两头必须对齐。
+        持久化没开（无 db）时跳过幂等表：纯内存模式本就没有崩溃恢复。
         """
         for tc in assistant.tool_calls:
             result = registry.dispatch(tc.name, tc.arguments)
+            if self.db is not None and self.session_id is not None:
+                self.db.record_executed_key(tc.id, self.session_id, {"content": result})
             self._record(Message(role="tool", tool_call_id=tc.id, content=result))
 
     # ---------- 主循环 ----------

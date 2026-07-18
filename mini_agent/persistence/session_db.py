@@ -30,7 +30,6 @@ _INTERRUPTED = json.dumps(
     ensure_ascii=False,
 )
 
-
 class MiniSessionDB:
 
     def __init__(self, path: str):
@@ -156,20 +155,9 @@ class MiniSessionDB:
     # ---------- 崩溃恢复 ----------
 
     def _sanitize_dangling_tool_calls(self, messages: list[Message]) -> list[Message]:
-        """把每一轮 assistant(tool_calls) 补足成配对完整、可安全发给 DeepSeek 的形状。
-
-        不变量:在【串行】主循环里,_execute_tool_calls 会把一轮的 N 个 tool 结果
-        全部落库后才回到循环顶去取下一个 assistant。所以一个残缺的轮次后面不可能
-        再挂消息 —— 悬空【至多一个,且必然在尾部】。
-
-        那为什么还遍历所有轮、而不是只查最后一个 assistant?
-        防御:M4 子代理 / M6 并行只读工具将来会引入【乱序回填】,一旦上面的不变量
-        被打破,只查尾部就会静默产出一个 400 的 transcript。遍历所有轮的成本可忽略
-        (complete 轮走 fast path,只是 dict 查一下),换来的是不依赖这个不变量。
-
-        补桩而非丢弃:残缺轮里已经落库的真实结果代表【已经发生的副作用】(邮件已发、
-        文件已写),丢掉它 = 恢复后模型不知情、必重做。所以整轮保留,缺失的位置
-        先查幂等表拿真结果,查不到才用 _INTERRUPTED 桩占位。
+        """
+        判断一对assistant - tool call 是否是正常结束的
+        正常结束就原样返回，否则就删除这这一对messages
         """
         # 第一遍:把所有 tool result 按 tool_call_id 建索引(不管它在哪个位置)
         results_by_id = {}

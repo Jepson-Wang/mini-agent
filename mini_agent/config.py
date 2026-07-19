@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,7 +35,28 @@ class Settings:
     base_url: str = DEEPSEEK_BASE_URL
     model: str = "deepseek-chat"        # V3 通用模型，完整支持 function calling
     max_turns: int = 25                 # IterationBudget 默认上限（主 agent）
+    request_timeout: float = 120.0      # 单次 LLM 调用超时（秒）；SDK 默认 600s 太长
     home: Path = DEFAULT_HOME           # 运行时状态根目录，见上
+
+
+def _num_env(name: str, default, cast):
+    """读数值型环境变量：解析失败时退回默认值并告警，绝不让一个坏值炸掉 import。
+
+    不 import log —— log 模块依赖 config，反过来 import 会成环。config 处在最
+    底层，只能用 stderr 直接喊。
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return cast(raw)
+    except (ValueError, TypeError):
+        print(
+            f"[config] 环境变量 {name}={raw!r} 无法解析为 {cast.__name__}，"
+            f"退回默认值 {default}",
+            file=sys.stderr,
+        )
+        return default
 
 
 def _load_settings() -> Settings:
@@ -42,7 +64,8 @@ def _load_settings() -> Settings:
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
         base_url=os.getenv("MINI_AGENT_BASE_URL", DEEPSEEK_BASE_URL),
         model=os.getenv("MINI_AGENT_MODEL", "deepseek-chat"),
-        max_turns=int(os.getenv("MINI_AGENT_MAX_TURNS", "25")),
+        max_turns=_num_env("MINI_AGENT_MAX_TURNS", 25, int),
+        request_timeout=_num_env("MINI_AGENT_REQUEST_TIMEOUT", 120.0, float),
         home=Path(os.getenv("MINI_AGENT_HOME", DEFAULT_HOME)).expanduser(),
     )
 

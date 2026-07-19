@@ -34,14 +34,11 @@ def isolated_registry():
     """
     registry_mod.discover_builtin_tools()
     tools_snapshot = dict(registry._tools)
-    checks_snapshot = dict(registry._toolset_checks)
     try:
         yield registry
     finally:
         registry._tools.clear()
         registry._tools.update(tools_snapshot)
-        registry._toolset_checks.clear()
-        registry._toolset_checks.update(checks_snapshot)
 
 
 def _tool_call_msg(call_id: str, name: str, arguments: dict) -> FakeMessage:

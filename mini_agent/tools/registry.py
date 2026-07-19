@@ -144,7 +144,6 @@ class ToolRegistry:
         # 写成 `self._tools = Dict[str, ToolEntry] = {}` 是**链式赋值**：
         # Python 会去执行 Dict.__setitem__((str, ToolEntry), {})，运行时直接 TypeError。
         self._tools: Dict[str, ToolEntry] = {}
-        self._toolset_checks: Dict[str, Callable] = {}
         self._lock = threading.RLock()
 
     def get_entry(self,name: str) -> Optional[ToolEntry]:
@@ -220,31 +219,18 @@ class ToolRegistry:
                 handler = handler,
                 check_fn = check_fn
             )
-            self._toolset_checks[toolset] = check_fn
-
-    def deregister(self,name) -> None:
-        """
-        1. 加可重入锁
-        2.删除一个ToolEntry
-        3.判断是否还有其他Toolentry,没有则返回，有就删除
-        :param self:
-        :return:
-        """
-        with self._lock:
-            entry = self._tools.pop(name,None)
-            if entry is None:
-                return
-            toolset_still_exists = any(
-                e.toolset ==entry.toolset for e in self._tools.values()
-            )
-            if not toolset_still_exists:
-                self._toolset_checks.pop(entry.toolset,None)
-
 
     def dispatch(self, name: str, args: Optional[dict] = None, **kwargs) -> str:
-        """执行一次工具调用。**永远返回合法 JSON 字符串**，绝不抛异常。
+        """执行一次工具调用。**永远返回字符串、绝不抛异常** —— 健壮性契约的硬核。
 
-        这是整个工具系统的健壮性契约：模型收到的必须是它能解析的东西。
+        「是不是 JSON」要说清楚，别让将来读代码的人误用：
+          - 错误一律是 {"error": ...} 的合法 JSON（_error 出口）；
+          - handler 返回非字符串时，本层 json.dumps 兜底成 JSON；
+          - 但 handler 自己返回的**字符串是原样放行、不校验**的。出厂 builtin 都按
+            约定返回 JSON，但这只是约定、不是强制。所以调用方**不能**假设 dispatch
+            的返回一定能 json.loads（别写 json.loads(dispatch(...)) —— read_file
+            这类工具完全可以直接返回纯文本给模型读）。
+
         工具炸了就回 {"error": ...}，让模型自己决定重试还是换路子；
         要是让异常冒到 loop 里，一次 read_file 读不到文件就能把整个 agent 打死。
 
@@ -326,10 +312,6 @@ class ToolRegistry:
             return json.dumps(result, ensure_ascii=False)
         except TypeError as e:
             return _error(f"Tool {name} returned a non-JSON-serializable value: {e}")
-
-    def _snapshot_state(self) -> tuple[list[ToolEntry],Dict[str,Callable]]:
-        with self._lock:
-            return list(self._tools.values()),dict(self._toolset_checks)
 
 
 # 全局唯一的注册表实例。工具模块靠 import 副作用自注册：

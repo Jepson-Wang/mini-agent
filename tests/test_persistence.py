@@ -359,6 +359,33 @@ def test_recover_skips_one_corrupt_row(db, db_path):
     assert [m.content for m in revived] == ["good-0", "good-1", "good-3"]
 
 
+def test_recover_stubs_when_idempotency_row_is_corrupt(db, db_path):
+    """幂等表的坏行 = 未命中，降级补桩，不许把整个 --resume 炸掉。
+
+    和上一个测试是同一条原则的两半：messages 表的坏行跳过，executed_keys 表的
+    坏行按未命中处理。两张表的容错态度必须一致——否则一行坏 JSON 会被 _db_guard
+    翻译成 PersistenceError 抛出，一路冒到 main()，这个会话从此再也 --resume
+    不了：明明只是缓存里一行脏数据，代价却是整段对话再也回不来。
+    """
+    sid = db.create_session()
+    db.append_message(sid, Message(role="user", content="发封邮件"))
+    db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
+
+    # 绕过 MiniSessionDB，直接塞一行坏 JSON（模拟 record_executed_key 写到一半断电）
+    raw = sqlite3.connect(db_path, isolation_level=None)
+    raw.execute(
+        "INSERT INTO executed_keys (idempotency_key, session_id, result, created_at) "
+        "VALUES (?, ?, ?, ?);",
+        ("call_1", sid, '{"content": "邮件已发', int(time.time())),
+    )
+    raw.close()
+
+    revived = MiniSessionDB(db_path).recover(sid)   # 不抛，就是这个测试的重点
+
+    assert [m.role for m in revived] == ["user", "assistant", "tool"]
+    assert revived[2].content == _INTERRUPTED
+
+
 # --------------------------------------------------------------------------
 # 5. 幂等表：first-write-wins
 # --------------------------------------------------------------------------

@@ -271,7 +271,16 @@ class MiniSessionDB:
     # ---------- 幂等表:两个方法分别用于获取 tool 结果和记录 tool 结果 ----------
 
     def get_executed_result(self, key: str) -> dict | None:
-        """查幂等缓存。命中返回 result dict,未命中返回 None。纯读,不开写事务。"""
+        """查幂等缓存。命中返回 result dict,未命中返回 None。纯读,不开写事务。
+
+        损坏的行按「未命中」处理,不抛。理由:本方法唯一的调用方是 recover 的补桩
+        分支,它对 None 的语义已经是「查不到真结果,补 interrupted 桩」——一行坏
+        JSON 的正确降级就是走同一条路。recover 对 messages 表的坏行也是跳过+告警,
+        两张表的容错态度必须一致,否则一行脏数据就能打死整个 --resume。
+        ★ json.loads 必须留在 _db_guard **外面**:guard 里有一个
+          except json.JSONDecodeError 分支,放进去会被它抢先翻译成
+          PersistenceError,下面这个 except ValueError 就永远接不到了。
+        """
         if not key:
             raise PersistenceError("get_executed_result: key 不能为空")
 
@@ -281,7 +290,16 @@ class MiniSessionDB:
             ).fetchone()
             if row is None:
                 return None
-            return json.loads(row["result"])
+            raw = row["result"]
+
+        try:
+            return json.loads(raw)
+        except ValueError as e:
+            # ValueError 覆盖 JSONDecodeError
+            logger.warning(
+                "get_executed_result: 幂等表行损坏 key=%s,按未命中处理: %s", key, e
+            )
+            return None
 
     def record_executed_key(
         self, key: str, session_id: str, result: dict

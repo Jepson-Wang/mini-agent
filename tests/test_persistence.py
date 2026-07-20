@@ -82,6 +82,69 @@ def test_end_session_marks_done(db):
     assert row["status"] == "done"
 
 
+def test_transition_status_cas_returns_whether_it_won(db):
+    """CAS 原语：只有 from_status 和当前状态匹配时才转移，返回值如实报告是否命中。"""
+    sid = db.create_session()                                   # running
+    assert db._transition_status(sid, "running", "done") is True     # 合法转移
+    assert db._transition_status(sid, "running", "done") is False    # 当前已 done，from 不匹配
+    assert db._transition_status(sid, "done", "failed") is True      # done -> failed 合法
+    assert db._transition_status("sess_ghost", "running", "done") is False  # 会话不存在
+
+
+def test_end_session_is_idempotent_cas(db):
+    """end_session 跑在 finally 里、可能被重复触发：第二次是安全 no-op，不抛、不覆盖终态。
+
+    无条件 UPDATE 也能重复调，但一旦将来有 failed/killed 终态，无条件写会把终态
+    覆盖回 done。CAS 的 WHERE status='running' 把「已是终态」挡在门外。
+    """
+    sid = db.create_session()
+    db.end_session(sid)          # running -> done
+    db.end_session(sid)          # 已是 done：CAS 命中 0 行，no-op，不抛
+
+    row = db.conn.execute(
+        "SELECT status FROM sessions WHERE session_id = ?;", (sid,)
+    ).fetchone()
+    assert row["status"] == "done"
+
+
+def test_root_session_defaults_genealogy_columns(db):
+    """不带参数建的 root 会话：parent 为 NULL、depth=0、spawn_budget_used=0。"""
+    sid = db.create_session()
+    row = db.conn.execute(
+        "SELECT parent_session_id, depth, spawn_budget_used "
+        "FROM sessions WHERE session_id = ?;",
+        (sid,),
+    ).fetchone()
+    assert row["parent_session_id"] is None
+    assert row["depth"] == 0
+    assert row["spawn_budget_used"] == 0
+
+
+def test_child_session_records_parent_and_depth(db):
+    """子代理会话：parent 指向父 sid、depth 逐层 +1。谱系链能查回来。"""
+    root = db.create_session()
+    child = db.create_session(parent_session_id=root, depth=1)
+    grandchild = db.create_session(parent_session_id=child, depth=2)
+
+    rows = {
+        r["session_id"]: r
+        for r in db.conn.execute(
+            "SELECT session_id, parent_session_id, depth FROM sessions;"
+        ).fetchall()
+    }
+    assert rows[child]["parent_session_id"] == root
+    assert rows[child]["depth"] == 1
+    assert rows[grandchild]["parent_session_id"] == child
+    assert rows[grandchild]["depth"] == 2
+
+
+def test_child_session_with_nonexistent_parent_raises(db):
+    """外键守门：parent_session_id 指向不存在的会话 → PersistenceError，不留孤儿。"""
+    with pytest.raises(PersistenceError) as exc:
+        db.create_session(parent_session_id="sess_ghost", depth=1)
+    assert isinstance(exc.value.__cause__, sqlite3.IntegrityError)
+
+
 # --------------------------------------------------------------------------
 # 3. append_message：seq 单调、updated_at 推进、约束校验
 # --------------------------------------------------------------------------

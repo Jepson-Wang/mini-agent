@@ -117,16 +117,25 @@ class MiniSessionDB:
 
     # ---------- session 生命周期 ----------
 
-    def create_session(self) -> str:
-        """建一个新 session，返回 sid。append_message 的前置。"""
+    def create_session(
+        self, parent_session_id: str | None = None, depth: int = 0
+    ) -> str:
+        """建一个新 session，返回 sid。append_message 的前置。
+
+        M4 谱系链：CLI 主会话（root）用默认值 parent_session_id=None、depth=0；
+        子代理由父会话创建，传入父 sid 和 depth+1。spawn_budget_used 一律从 0 起，
+        之后只有 root 行会被累加（全树 spawn 预算记在 root 上，见 M4）。
+        """
         sid = f"sess_{uuid.uuid4().hex[:12]}"
         now = int(time.time())
         with self._db_guard("create_session"):
             with self._write_txn() as c:
                 c.execute(
-                    "INSERT INTO sessions (session_id, status, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?);",
-                    (sid, "running", now, now),
+                    "INSERT INTO sessions "
+                    "(session_id, status, created_at, updated_at, "
+                    " parent_session_id, depth, spawn_budget_used) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0);",
+                    (sid, "running", now, now, parent_session_id, depth),
                 )
         return sid
 
@@ -140,17 +149,47 @@ class MiniSessionDB:
             ).fetchone()
         return row is not None
 
-    def end_session(self, session_id) -> None:
+    def _transition_status(
+        self, session_id: str, from_status: str, to_status: str
+    ) -> bool:
+        """CAS 状态转移：仅当当前 status == from_status 时，才把它置为 to_status。
+
+        返回本次是否真的转移成功（UPDATE 命中 1 行）。rowcount == 0 有两种可能：
+        会话不存在，或它当前状态不是 from_status（已被别的路径改过 / 重复调用）。
+        本方法**不抛**这种情况，交给调用方判断——「转移没发生」常常是合法的幂等
+        重入，不该当错误。
+
+        为什么用 CAS 而不是无条件 UPDATE：状态转移必须「从某个已知态出发」才合法。
+        无条件 SET status='done' 会把一个已经 failed/killed 的会话悄悄改回 done、
+        丢掉真实结局；带上 WHERE status = from_status，非法转移自然命中 0 行、被
+        rowcount 拦下。M4 里父代理 kill 子代理(running→killed)与子代理自己正常结束
+        (running→done)会竞争同一行，CAS 保证只有一个赢、且赢家可判定。
         """
-        __main__.py 正常退出时会调它
-        """
-        with self._db_guard(f"end_session(session={session_id})"):
+        now = int(time.time())
+        with self._db_guard(
+            f"_transition_status(session={session_id}, {from_status}->{to_status})"
+        ):
             with self._write_txn() as c:
-                c.execute(
-                    "UPDATE sessions SET status = 'done', updated_at = ? "
-                    "WHERE session_id = ?;",
-                    (int(time.time()), session_id),
+                cur = c.execute(
+                    "UPDATE sessions SET status = ?, updated_at = ? "
+                    "WHERE session_id = ? AND status = ?;",
+                    (to_status, now, session_id, from_status),
                 )
+                # rowcount 在 execute 后即确定（DML 立刻可读），趁事务内读掉
+                changed = cur.rowcount == 1
+        return changed
+
+    def end_session(self, session_id) -> None:
+        """__main__.py 退出时（正常 / Ctrl-C / 异常）在 finally 里调它。
+
+        CAS：只把 running 的会话置为 done。重复调用、或会话已是终态时是安全的
+        no-op（只告警不抛）——它跑在 finally 里，一旦抛异常会盖掉 try 里真正的错误。
+        """
+        if not self._transition_status(session_id, "running", "done"):
+            logger.warning(
+                "end_session: 会话 %s 不在 running 态（已结束或不存在），跳过",
+                session_id,
+            )
 
     # ---------- 崩溃恢复 ----------
 

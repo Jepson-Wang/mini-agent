@@ -28,3 +28,9 @@ testpaths = ["tests"]
 # 项目根在 sys.path 上。绝不要把 mini_agent/ 本身加进来——那会让 schema / config
 # / log 这些通用名变成顶层模块，既污染命名空间，又让同一份代码有两个模块身份。
 pythonpath = ["."]
+markers = [
+    # 真·进程级 kill 的崩溃恢复测试：要拉子进程，比其它测试慢一两个数量级。
+    #   pytest -m "not slow"   平时开发
+    #   pytest -m slow         单独跑崩溃恢复
+    "slow: 需要拉子进程的慢测试（真 kill 崩溃恢复）",
+]

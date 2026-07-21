@@ -139,7 +139,7 @@ class MiniSessionDB:
                 )
         return sid
 
-    def session_exists(self, session_id) -> bool:
+    def session_exists(self, session_id: str) -> bool:
         """
         用户 --resume sess_xxx 时先校验，不存在就早报错
         """
@@ -179,7 +179,7 @@ class MiniSessionDB:
                 changed = cur.rowcount == 1
         return changed
 
-    def end_session(self, session_id) -> None:
+    def end_session(self, session_id: str) -> None:
         """__main__.py 退出时（正常 / Ctrl-C / 异常）在 finally 里调它。
 
         CAS：只把 running 的会话置为 done。重复调用、或会话已是终态时是安全的
@@ -191,12 +191,44 @@ class MiniSessionDB:
                 session_id,
             )
 
+    def reopen_session(self, session_id: str) -> bool:
+        """--resume 时把会话从 done 拉回 running。补上状态机缺的那条反向边。
+
+        没有它，--resume 一个已正常退出的会话会留下两个毛病：续聊全程 status 写着
+        done（标签撒谎，session list / M4 存活检查全都不可信），且退出时 finally 里的
+        end_session 必然 CAS 失败、打一条假告警——那条告警本是为「重复调用」设计的，
+        在正常路径上必响就成了狼来了，真出事时没人会看。
+
+        ★ 返回 False 在这里的含义是唯一的。 调用方（__main__）已经先用
+        session_exists 排除了「会话不存在」，所以 CAS 没命中只剩一种解释：
+        **它当前就是 running** —— 要么上次被 kill 没走完 finally（合法，正是崩溃
+        恢复要处理的情况），要么另一个进程正开着它（并发 --resume，危险）。
+        本层区分不了这两者，所以只如实返回、不抛，把判断留给调用方。
+        M4 父子代理共享同一个 db 时，这里要升级成带 owner/heartbeat 的租约才能真正
+        分辨；那之前它至少是个探测点，别把这个信息浪费掉。
+        """
+        return self._transition_status(session_id, "done", "running")
+
     # ---------- 崩溃恢复 ----------
 
     def _sanitize_dangling_tool_calls(self, messages: list[Message]) -> list[Message]:
-        """
-        判断一对assistant - tool call 是否是正常结束的
-        正常结束就原样返回，否则就删除这这一对messages
+        """把每一轮 assistant(tool_calls) 补足成配对完整、可安全发给 DeepSeek 的形状。
+
+        ★ 补桩,不是丢弃。 残缺的那一轮**绝不能删**:删掉 = 抹掉「这个工具可能
+        已经跑过」这个事实,模型看不见就会重做一遍(邮件重发、文件重写)。正确解法
+        是给每个没有结果的 tool_call 补一条 role="tool" 消息 —— 配对补齐(不 400),
+        同时如实告诉模型「这次调用结果未知」,让它自己决定要不要重试。
+        补桩前先查幂等表:命中说明崩在「已 record_executed_key、还没 append_message」
+        之间,能拿回真结果,一次都不用重跑。
+
+        ★ 补桩 != 重跑。 本方法执行零个 handler、零次 LLM 调用,纯读 + 纯计算。
+        恢复过程一旦有副作用,你就得为恢复写恢复,那是个无底洞。
+
+        不变量:在【串行】主循环里,_execute_tool_calls 会把一轮的 N 个 tool 结果
+        全部落库后才回到循环顶去取下一个 assistant。所以残缺的轮次后面不可能再挂
+        消息 —— 悬空【至多一个,且必然在尾部】。这里仍然遍历全部消息而不是只看
+        尾巴,是防御性的:M4 子代理 / M6 并行工具会打破这个串行前提,到那时只处理
+        尾部就会漏。顺带,按 tool_calls 的顺序重排结果,乱序也能被修正。
         """
         # 第一遍:把所有 tool result 按 tool_call_id 建索引(不管它在哪个位置)
         results_by_id = {}

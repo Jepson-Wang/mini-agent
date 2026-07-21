@@ -15,7 +15,7 @@ import sys
 
 from mini_agent.agent import Agent
 from mini_agent.config import settings
-from mini_agent.persistence.session_db import MiniSessionDB
+from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
 
 # 默认工具集。web_fetch 另受 ALLOW_WEB 门控（没开就不会暴露给模型）；
 # file 工具目前还没实现，写好后会自动出现在这个集合里。
@@ -53,7 +53,30 @@ def main() -> None:
             print(f"会话不存在: {resume_sid}", file=sys.stderr)
             sys.exit(1)
         session_id = resume_sid
-        history = db.recover(resume_sid)   # 从库里重建历史（残缺轮已补桩，可安全续跑）
+
+        # ★ 顺序要紧：先 recover，再 reopen。
+        #   recover 是纯读的，失败了库还和没跑过一样，可以原地重试；而
+        #   reopen_session 是一个**承诺**——「我现在接管这个会话了」。不该在确认
+        #   自己接管得了之前就把 status 改掉：反过来写的话，recover 一抛就把会话
+        #   永久卡在 running，下次 --resume 还会误报「上次未正常退出」。
+        try:
+            history = db.recover(resume_sid)  # 残缺轮已补桩，可安全续跑
+        except PersistenceError as e:
+            # 恢复不了就响亮地死，绝不静默退化成空历史 —— 那样用户以为在续聊，
+            # 实际在开新的，而新消息还会以 seq 接着写进同一个 session，把库里那段
+            # transcript 变成两段无关对话的拼接，事后无法分辨。
+            print(f"无法恢复会话 {resume_sid}：{e}\n"
+                  f"这段历史仍在库里（{_db_path()}），没有被改动。\n"
+                  f"可以直接 `python -m mini_agent` 开一个新会话继续工作。",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        # CAS 没命中说明它本来就是 running：要么上次被 kill 没走完 finally
+        # （正常，继续），要么另一个进程正开着它（危险）。M2 是单进程 CLI，
+        # 这里只提示放行；M4 共享 db 时要换成带 owner/heartbeat 的租约。
+        if not db.reopen_session(resume_sid):
+            print(f"提示：会话 {resume_sid} 上次未正常退出（或正被另一个进程使用）",
+                  file=sys.stderr)
         agent = Agent(session_id=session_id, db=db, toolset=DEFAULT_TOOLSET,
                       max_turns=settings.max_turns, initial_messages=history)
         print(f"恢复会话 {session_id}（{len(history)} 条历史）")

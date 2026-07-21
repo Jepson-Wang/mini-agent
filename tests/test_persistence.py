@@ -107,6 +107,59 @@ def test_end_session_is_idempotent_cas(db):
     assert row["status"] == "done"
 
 
+def _status(db, sid):
+    return db.conn.execute(
+        "SELECT status FROM sessions WHERE session_id = ?;", (sid,)
+    ).fetchone()["status"]
+
+
+def test_reopen_session_pulls_done_back_to_running(db):
+    """--resume 缺的那条反向边：done -> running。"""
+    sid = db.create_session()
+    db.end_session(sid)
+    assert _status(db, sid) == "done"
+
+    assert db.reopen_session(sid) is True
+    assert _status(db, sid) == "running"
+
+
+def test_reopen_session_returns_false_when_already_running(db):
+    """会话已经是 running（上次被 kill 没走完 finally）→ CAS 不命中，如实返回 False。
+
+    调用方已用 session_exists 排除了「不存在」，所以 False 只剩这一种含义。
+    它不是错误：正是崩溃恢复要处理的常态。状态也不能被改坏。
+    """
+    sid = db.create_session()                 # 从没 end 过，还是 running
+
+    assert db.reopen_session(sid) is False
+    assert _status(db, sid) == "running"      # 没被动
+
+
+def test_resume_cycle_keeps_status_honest_and_quiet(db, db_path, caplog):
+    """整条 --resume 生命周期的回归测试：状态标签不许撒谎，正常路径不许打告警。
+
+    没有 reopen_session 时的老行为（这测试就是来钉死它的）：
+      - 续聊全程 status 停在 done —— 会话活着但标签写着结束；
+      - 退出时 end_session 的 CAS 必然落空，在**完全正常**的路径上打一条
+        「不在 running 态」告警。那条告警本是给「重复调用」用的，正常路径必响
+        就成了狼来了，真出事时会被无视。
+    """
+    sid = db.create_session()
+    db.append_message(sid, Message(role="user", content="q1"))
+    db.end_session(sid)                                     # 第一次运行退出
+
+    with caplog.at_level("WARNING", logger="mini_agent.persistence.session_db"):
+        db.reopen_session(sid)                              # --resume
+        db.append_message(sid, Message(role="user", content="q2"))
+        assert _status(db, sid) == "running"                # ← 续聊期间不撒谎
+        db.end_session(sid)                                 # 退出
+
+    assert _status(db, sid) == "done"
+    assert caplog.text == ""                                # ← 正常路径必须安静
+    # 历史没丢：两次运行的消息都在
+    assert [m.content for m in MiniSessionDB(db_path).recover(sid)] == ["q1", "q2"]
+
+
 def test_root_session_defaults_genealogy_columns(db):
     """不带参数建的 root 会话：parent 为 NULL、depth=0、spawn_budget_used=0。"""
     sid = db.create_session()

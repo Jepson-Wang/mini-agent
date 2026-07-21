@@ -412,6 +412,52 @@ def test_recover_skips_one_corrupt_row(db, db_path):
     assert [m.content for m in revived] == ["good-0", "good-1", "good-3"]
 
 
+def test_recover_stubs_tool_call_with_empty_id_instead_of_raising(db, db_path):
+    """tool_call 的 id 是空串 → 补桩，不许抛。
+
+    空 id 不是假想情况：ToolCall.id 没有 min_length，而 ToolCall.from_openai 在
+    SDK 漏给 id 时默认就填 ""。这样一条消息会被落库。
+    危险在于 get_executed_result 有个「key 不能为空」的守卫——它是用来抓**调用方
+    编程错误**的，完全正当；但 recover 传进去的是**从库里读出来的历史数据**。
+    同一个守卫在这里会把一次数据异常升级成 PersistenceError，让这个会话
+    **永远 --resume 不了**（坏数据在库里，每次读都一样，重试无用）。
+
+    recover 面对历史数据的铁律：任何「这不该发生」都降级，不抛。
+    """
+    sid = db.create_session()
+    db.append_message(
+        sid,
+        Message(role="assistant", tool_calls=[ToolCall(id="", name="f", arguments={})]),
+    )
+
+    revived = MiniSessionDB(db_path).recover(sid)   # 不抛，就是重点
+
+    assert [m.role for m in revived] == ["assistant", "tool"]
+    assert revived[1].content == _INTERRUPTED
+
+
+@pytest.mark.parametrize("bad_content", [{"nested": 1}, 42, ["x"], True, None])
+def test_recover_stubs_when_cached_content_is_not_a_string(db, db_path, bad_content):
+    """幂等表里的 content 不是字符串 → 按未命中补桩，不许抛。
+
+    Message.content 是 str|None，塞个 dict/int 进去会抛 pydantic ValidationError。
+    这条比其它坏数据更阴：ValidationError **不是** PersistenceError，_db_guard
+    只认 sqlite3/json 异常拦不住它，__main__ 的 except PersistenceError 也接不住
+    —— 用户拿到裸 traceback，且这个会话永久 --resume 不了。
+
+    而 {"content": <str>} 只是 agent.py 和 session_db.py 之间的口头约定：
+    record_executed_key 的签名收任意 dict，没有任何东西强制形状。读侧必须自己扛。
+    """
+    sid = db.create_session()
+    db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
+    db.record_executed_key("call_1", sid, {"content": bad_content})
+
+    revived = MiniSessionDB(db_path).recover(sid)
+
+    assert [m.role for m in revived] == ["assistant", "tool"]
+    assert revived[1].content == _INTERRUPTED
+
+
 def test_recover_stubs_when_idempotency_row_is_corrupt(db, db_path):
     """幂等表的坏行 = 未命中，降级补桩，不许把整个 --resume 炸掉。
 

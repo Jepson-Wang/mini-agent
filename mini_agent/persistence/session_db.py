@@ -257,27 +257,71 @@ class MiniSessionDB:
                 # 结果没落库 → 先看幂等表里有没有 handler 真跑出来的结果。
                 # 命中说明崩在"已 record_executed_key、还没 append_message"之间,
                 # 这一步是无损恢复;未命中才是真丢了。
-                cached = self.get_executed_result(tc.id)
-                content = cached.get("content") if isinstance(cached, dict) else None
-                if content is not None:
-                    logger.warning("recover: tc=%s 用幂等表里的真结果补回", tc.id)
-                else:
+                #
+                # ★ 空 id 必须自己挡掉,不能交给 get_executed_result。
+                #   那里的「key 不能为空」守卫是用来抓**调用方的编程错误**的,完全
+                #   正当;但 recover 传进去的不是程序算出来的值,而是**从库里读出来
+                #   的历史数据** —— ToolCall.id 允许空串,且 from_openai 在 SDK 漏
+                #   给 id 时默认就是 ""。同一个守卫在这里会把一次数据异常升级成
+                #   PersistenceError,让这个会话**永远 --resume 不了**。
+                #   recover 面对历史数据的铁律:任何"这不该发生"都降级,不抛。
+                if not tc.id:
+                    # 没 id 就无从查表,也无从配对,直接补桩收场。
                     content = _INTERRUPTED
-                    logger.warning("recover: tc=%s 结果丢失,补 interrupted 桩", tc.id)
+                    logger.warning("recover: tool_call 缺 id,无法配对,补 interrupted 桩")
+                else:
+                    cached = self.get_executed_result(tc.id)
+                    content = cached.get("content") if isinstance(cached, dict) else None
+                    # ★ 必须是字符串才认。 Message.content 是 str|None,塞个 dict/int
+                    #   进去会抛 pydantic ValidationError —— 那不是 PersistenceError,
+                    #   _db_guard 拦不住(它只认 sqlite3/json 异常),__main__ 的
+                    #   except PersistenceError 也接不住,用户得到裸 traceback 且这个
+                    #   会话永久 --resume 不了。
+                    #   而 {"content": <str>} 只是 agent.py 和这里的口头约定:
+                    #   record_executed_key 的签名收任意 dict,没有任何东西强制形状。
+                    #   读侧必须自己扛住 —— 库里的东西是谁写的、什么时候写的,recover
+                    #   一概不知道,只能假设它可能是任何形状。
+                    if isinstance(content, str):
+                        logger.warning("recover: tc=%s 用幂等表里的真结果补回", tc.id)
+                    else:
+                        if content is not None:
+                            logger.warning(
+                                "recover: tc=%s 幂等表里的 content 是 %s 不是 str,"
+                                "按未命中处理", tc.id, type(content).__name__,
+                            )
+                        content = _INTERRUPTED
+                        logger.warning("recover: tc=%s 结果丢失,补 interrupted 桩", tc.id)
 
                 # 补出来的这条必须和真结果长得一模一样,否则照样 400
                 kept.append(Message(role="tool", tool_call_id=tc.id, content=content))
 
         return kept
 
-    def recover(self, session_id) -> list[Message]:
+    def recover(self, session_id: str) -> list[Message]:
         """
         从磁盘上的事实,重建出一个"可以安全地继续跑主循环"的内存状态。
         就这一件。它不执行工具、不调 LLM、不写任何东西(除了可能改 session status)。
         它是纯读 + 重建。
 
-        容错:单行 content 损坏(JSON 坏了 / schema 对不上)时,跳过这一行并告警,
-        而不是让整个 --resume 崩掉 —— 崩溃恢复本身就不该被一行脏数据打死。
+        ★ 容错契约:recover 的输入是【历史数据】,不是程序状态。
+          对程序状态该 fail-fast 的地方,对历史数据必须降级。库里的东西是谁写的、
+          什么时候写的、被什么版本的代码写的,recover 一概不知道,只能假设它可能
+          是任何形状。已经踩过四次同一个坑,每次症状都一样:一处"这不该发生"的
+          检查被历史数据触发 → 抛异常 → 那个会话**永久** --resume 不了(坏数据
+          在库里,重试一万次结果相同):
+            1. messages 行 JSON 坏 → 跳过该行 + 告警
+            2. executed_keys 行 JSON 坏 → 按未命中处理
+            3. tool_call 的 id 是空串 → 直接补桩,不去踩空 key 守卫
+            4. 幂等表里的 content 不是 str → 按未命中处理
+                 (这条最阴:抛的是 pydantic ValidationError,不是 PersistenceError,
+                  _db_guard 拦不住、__main__ 也接不住)
+
+        降级的边界:影响【一条历史】的错误就地降级(跳过/补桩)+ 告警,整体照常返回;
+        影响【访问历史的能力】的错误(整张表读不了、库损坏)才抛,交上层决定。
+
+        对应地,这里没有任何重试:失败的全是确定性错误,同样的输入必然同样的结果。
+        重试只在"两次尝试的输入可能不同"时才有意义。锁争用那类瞬时错误由
+        PRAGMA busy_timeout 在 SQLite 层兜住,不必在应用层再套一层。
         """
         with self._db_guard(f"recover(session={session_id})"):
             rows = self.conn.execute(

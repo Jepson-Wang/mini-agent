@@ -45,7 +45,18 @@ def main() -> None:
               file=sys.stderr)
         sys.exit(1)
 
-    db = MiniSessionDB(_db_path())
+    # 打开库本身也会失败：路径无权限、磁盘满、文件损坏（sqlite3.connect 是惰性的，
+    # 损坏要到第一条 PRAGMA 才暴露）。持久化层已把这些收敛成 PersistenceError，
+    # 这里接住给一句人话，而不是甩一坨 traceback。
+    try:
+        db = MiniSessionDB(_db_path())
+    except PersistenceError as e:
+        print(f"无法打开数据库：{e}\n"
+              f"位置：{_db_path()}\n"
+              f"若确认这个文件已损坏，删掉它即可重新开始（会丢失全部历史会话）。",
+              file=sys.stderr)
+        sys.exit(1)
+
     resume_sid = _parse_resume(sys.argv[1:])
 
     if resume_sid is not None:

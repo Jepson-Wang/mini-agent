@@ -24,6 +24,9 @@ class PersistenceError(Exception):
 
 _VALID_ROLES = {"system", "user", "assistant", "tool"}
 
+# _create_tables 用它判断"表是否已就绪"，从而跳过写锁。改动建表语句时要同步改这里。
+_TABLES = ("sessions", "messages", "executed_keys")
+
 # 崩在"tool 结果没落库"的瞬间、且幂等表里也没有真结果时,用它补桩。
 _INTERRUPTED = json.dumps(
     {"error": "interrupted: 上次运行崩溃，这个工具调用的结果未知"},
@@ -38,18 +41,29 @@ class MiniSessionDB:
         #   但光开这个不够:两个线程同时 BEGIN IMMEDIATE 会撞
         #   "cannot start a transaction within a transaction"(那是连接级状态,
         #   不是数据库级锁)。所以写事务再用一把 RLock 串行化,见 _write_txn。
-        self.conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self._txn_lock = threading.RLock()
-        self._configure()
+        # 整个构造过程都要收进 _db_guard:它是持久化层的边界,边界上只能抛
+        # PersistenceError。漏一个裸 sqlite3 异常出去,调用方那句
+        # `except PersistenceError` 就白写了 —— __main__ 里那条"数据还在、可以开
+        # 新会话"的友好提示曾经就是这么失效的(库文件损坏 → 裸 DatabaseError)。
+        with self._db_guard(f"打开数据库({path})", hint="(路径不存在 / 无权限 / 文件损坏)"):
+            self.conn = sqlite3.connect(
+                path, isolation_level=None, check_same_thread=False
+            )
+            self.conn.row_factory = sqlite3.Row
+            self._txn_lock = threading.RLock()
+            self._configure()
         self._create_tables()
 
     def _configure(self):
+        """连接级设置。注意 sqlite3.connect() 是惰性的——它不读文件头,所以
+        "文件不是数据库"这类损坏要到这里第一条 PRAGMA 才会暴露。
+        本方法由 __init__ 在 _db_guard 内调用,自己不再重复包一层。
+        """
         c = self.conn
-        c.execute("PRAGMA journal_mode=WAL;")  # 你学过:redo 日志,崩溃可重放
-        c.execute("PRAGMA foreign_keys=ON;")  # SQLite 默认关!你 messages 有 FK
+        c.execute("PRAGMA journal_mode=WAL;")
+        c.execute("PRAGMA foreign_keys=ON;")  # SQLite 默认关
         c.execute("PRAGMA busy_timeout=5000;")  # 拿不到锁时等 5s 再报 BUSY
-        c.execute("PRAGMA synchronous=NORMAL;")  # ← 这个留给你决定
+        c.execute("PRAGMA synchronous=NORMAL;")
 
     # ---------- 异常收敛：底层 sqlite/json 异常 → PersistenceError ----------
 
@@ -109,7 +123,26 @@ class MiniSessionDB:
                 raise
 
     def _create_tables(self):
+        """建表。★ 先读后写:表已就绪时直接返回,不碰写锁。
+
+        原本无条件走 _write_txn,意味着**哪怕只想读**,构造一个 handle 也要抢
+        BEGIN IMMEDIATE 的写锁 —— 别人正在写时,一个纯读的 --resume 会被卡满
+        busy_timeout(实测 5.5s)甚至失败。而 WAL 下读者本该永不被写者阻塞,这等于
+        把 WAL 的好处在门口就丢掉了。M4 多进程共享 db 时这会变成常态。
+
+        竞态安全:两个进程可能都看到表不全、都去建,但 CREATE TABLE IF NOT EXISTS
+        幂等,且在 BEGIN IMMEDIATE 里串行,最多白跑一次。
+        """
         with self._db_guard("_create_tables"):
+            placeholders = ",".join("?" * len(_TABLES))
+            n = self.conn.execute(
+                f"SELECT COUNT(*) FROM sqlite_master "
+                f"WHERE type='table' AND name IN ({placeholders});",
+                _TABLES,
+            ).fetchone()[0]
+            if n == len(_TABLES):
+                return
+
             with self._write_txn() as c:
                 c.execute(SESSION_CREATE_SQL)
                 c.execute(MESSAGES_CREATE_SQL)

@@ -19,12 +19,16 @@ from mini_agent.schema import Message
 
 
 @pytest.fixture
-def cli(tmp_path, monkeypatch):
-    """把 CLI 的运行时状态整个搬到 tmp_path，并塞一个假 key 让 main() 肯往下走。
+def cli_env(tmp_path, monkeypatch):
+    """只做环境改写：把 CLI 的运行时状态搬到 tmp_path，塞个假 key 让 main() 肯往下走。
 
     settings 是 frozen dataclass，改不了字段，所以用 dataclasses.replace 造一个新的
     整体换掉 __main__ 模块里的那个名字。_db_path() 查的是模块全局 settings，
     所以它会跟着一起改。
+
+    ★ 故意**不建库**。需要一个损坏库的测试必须自己往一个干净路径上写垃圾字节——
+      要是这里先建了合法库，它的连接和 -wal 文件还开着，事后覆盖主库文件
+      SQLite 会从 WAL 把内容replay 回来，垃圾字节根本不生效。
     """
     monkeypatch.setattr(
         M, "settings", dataclasses.replace(
@@ -32,7 +36,13 @@ def cli(tmp_path, monkeypatch):
         )
     )
     monkeypatch.setattr("builtins.input", lambda *a: "exit")
-    return MiniSessionDB(str(tmp_path / "state.db"))
+    return tmp_path
+
+
+@pytest.fixture
+def cli(cli_env):
+    """cli_env + 一个建好的空库，返回该 db 句柄。"""
+    return MiniSessionDB(str(cli_env / "state.db"))
 
 
 def _status(db, sid):
@@ -91,6 +101,26 @@ def test_failed_recover_does_not_touch_session_status(cli, monkeypatch, capsys):
     # 并给一条出路，而不是甩一坨 traceback。
     assert "没有被改动" in err
     assert "python -m mini_agent" in err
+
+
+def test_corrupt_db_file_gives_a_readable_message_not_a_traceback(cli_env, monkeypatch,
+                                                                  capsys):
+    """库文件损坏时，用户该看到一句人话 + 一条出路，而不是一坨 traceback。
+
+    这条钉的是 __main__ 和持久化层之间的异常契约：MiniSessionDB(...) 曾经会漏出
+    裸 sqlite3.DatabaseError（_configure 不在 _db_guard 里），于是这里的
+    except PersistenceError 接不住，精心写的提示一次都不会显示。
+    """
+    (cli_env / "state.db").write_bytes(b"SQLite format 3\x00" + b"\xde\xad" * 900)
+    monkeypatch.setattr(sys, "argv", ["mini_agent"])
+
+    with pytest.raises(SystemExit) as exc:
+        M.main()
+
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "无法打开数据库" in err
+    assert "删掉它即可重新开始" in err          # 必须给出路
 
 
 def test_resume_nonexistent_session_exits_before_touching_anything(cli, monkeypatch):

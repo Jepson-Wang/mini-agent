@@ -57,6 +57,47 @@ def test_wal_and_foreign_keys_are_on(db):
 # 2. session 生命周期
 # --------------------------------------------------------------------------
 
+def test_corrupt_db_file_raises_persistence_error_not_raw_sqlite(tmp_path):
+    """损坏的库文件必须抛 PersistenceError，不许漏裸 sqlite3 异常。
+
+    _db_guard 的全部意义是「持久化层是模块边界，边界上只暴露自己的异常类型」。
+    漏一个出去，调用方那句 except PersistenceError 就白写了 —— __main__ 里
+    「数据还在、可以开新会话」的友好提示曾经就是这么失效的。
+
+    注意 sqlite3.connect() 是惰性的：它根本不读文件头，所以「这不是个数据库」
+    要到 _configure 的第一条 PRAGMA 才暴露。构造函数整体都得在 guard 里。
+    """
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"SQLite format 3\x00" + b"\xde\xad\xbe\xef" * 500)
+
+    with pytest.raises(PersistenceError) as exc:
+        MiniSessionDB(str(bad))
+    assert isinstance(exc.value.__cause__, sqlite3.Error)   # 异常链没断
+
+
+def test_opening_existing_db_does_not_need_the_write_lock(db, db_path):
+    """表已就绪时，构造一个 handle 不该抢写锁 —— 纯读路径不能被写者挡在门口。
+
+    原本 _create_tables 无条件走 BEGIN IMMEDIATE，于是别人正在写时，一个只想
+    读的 --resume 会被卡满 busy_timeout（实测 5.5s）甚至失败。WAL 下读者本该
+    永不被写者阻塞，那样等于在门口就把 WAL 的好处丢了。
+    """
+    db.create_session()
+
+    hog = sqlite3.connect(db_path, isolation_level=None)
+    hog.execute("BEGIN IMMEDIATE;")          # 死死占住写锁
+    try:
+        t0 = time.perf_counter()
+        MiniSessionDB(db_path)               # 不该在这里卡住
+        elapsed = time.perf_counter() - t0
+    finally:
+        hog.execute("ROLLBACK;")
+        hog.close()
+
+    # busy_timeout 是 5s；真去抢写锁的话这里必然是秒级
+    assert elapsed < 1.0, f"打开已存在的库花了 {elapsed:.2f}s，说明还在抢写锁"
+
+
 def test_create_session_and_exists(db):
     sid = db.create_session()
 

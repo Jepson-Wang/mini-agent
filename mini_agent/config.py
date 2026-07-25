@@ -33,7 +33,7 @@ DEFAULT_HOME = PROJECT_ROOT / ".mini_agent"
 class Settings:
     deepseek_api_key: str
     base_url: str = DEEPSEEK_BASE_URL
-    model: str = "deepseek-chat"        # V3 通用模型，完整支持 function calling
+    model: str = "deepseek-v4-flash"    # deepseek-chat 已下线，flash 为新命名下最接近的通用档位
     max_turns: int = 25                 # IterationBudget 默认上限（主 agent）
     request_timeout: float = 120.0      # 单次 LLM 调用超时（秒）；SDK 默认 600s 太长
     home: Path = DEFAULT_HOME           # 运行时状态根目录，见上
@@ -63,7 +63,7 @@ def _load_settings() -> Settings:
     return Settings(
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
         base_url=os.getenv("MINI_AGENT_BASE_URL", DEEPSEEK_BASE_URL),
-        model=os.getenv("MINI_AGENT_MODEL", "deepseek-chat"),
+        model=os.getenv("MINI_AGENT_MODEL", "deepseek-v4-flash"),
         max_turns=_num_env("MINI_AGENT_MAX_TURNS", 25, int),
         request_timeout=_num_env("MINI_AGENT_REQUEST_TIMEOUT", 120.0, float),
         home=Path(os.getenv("MINI_AGENT_HOME", DEFAULT_HOME)).expanduser(),

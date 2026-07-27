@@ -182,6 +182,44 @@ class MiniSessionDB:
             ).fetchone()
         return row is not None
 
+    def ensure_session(
+        self, session_id: str, parent_session_id: str | None = None, depth: int = 0
+    ) -> bool:
+        """幂等地保证 sessions 表里有这一行；返回本次是否**新建**。
+
+        服务化之后 session 身份由调用方（Go）铸造，我们这一行只是它的从属子记录：
+        存在的意义是满足 messages / executed_keys 的外键约束，外加存 depth/parent。
+        所以这里**不 mint id**，给什么 id 就落什么 id —— 这正是它和 create_session
+        的分工（后者自己 mint，供测试和 CLI 用）。
+
+        ★ 先探一次再决定要不要写。 每一轮对话开头都会调它，而绝大多数请求落在
+          已存在的 session 上；探到就直接返回，全程不碰写锁。否则 WAL「读者永不
+          被写者阻塞」的好处会在每一轮开头都被丢掉一次。同 _create_tables 的套路。
+
+        竞态安全：两个进程可能都探到不存在、都去 INSERT，ON CONFLICT DO NOTHING
+        保证幂等，最多白跑一次；rowcount 如实反映"这行到底是不是我建的"。
+        """
+        if not session_id:
+            raise PersistenceError("ensure_session: session_id 不能为空")
+
+        if self.session_exists(session_id):   # 自带 _db_guard，不必再套一层
+            return False
+
+        now = int(time.time())
+        with self._db_guard(f"ensure_session(session={session_id})"):
+            with self._write_txn() as c:
+                cur = c.execute(
+                    "INSERT INTO sessions "
+                    "(session_id, status, created_at, updated_at, "
+                    " parent_session_id, depth, spawn_budget_used) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0) "
+                    "ON CONFLICT(session_id) DO NOTHING;",
+                    (session_id, "running", now, now, parent_session_id, depth),
+                )
+                # rowcount 在 execute 后即确定，趁事务内读掉（同 _transition_status）
+                created = cur.rowcount == 1
+        return created
+
     def _transition_status(
         self, session_id: str, from_status: str, to_status: str
     ) -> bool:

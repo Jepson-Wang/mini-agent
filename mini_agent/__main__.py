@@ -5,9 +5,13 @@
   python -m mini_agent --resume sess_xxx  从库里恢复既有会话继续聊
 
 [M0] 只做一个 surface（CLI）。Agent 类本身 surface 无关，方便后续复用
-（如 subagent / HTTP server）。
-[M2] 每条消息即时落库；--resume 靠 db.recover() 重建对话。会话 id 会打印出来，
-     方便下次 --resume。
+（如 subagent / gRPC server）。
+[M2] 每条消息即时落库。会话 id 会打印出来，方便下次 --resume。
+[M2.5] Agent 无状态化后，CLI 的职责收缩成两件事：**铸造 / 认领一个 session_id**，
+     然后每轮把它连同用户输入一起传给共享的 agent。历史加载、崩溃补桩都在
+     run_conversation 内部完成，所以这里不再有"新建 vs 续跑"两条装配路径。
+     将来的 gRPC server 是第二个同样薄的 surface：session_id 从 Go 那边来，
+     其余一模一样。
 """
 from __future__ import annotations
 
@@ -65,6 +69,10 @@ def main() -> None:
             sys.exit(1)
         session_id = resume_sid
 
+        # ★ 这次 recover 是**探路**，不是装配。 历史真正的加载在 run_conversation
+        #   里（每轮都做）；这里跑一遍只为两件 CLI 专属的事：把"这段历史还能不能
+        #   读"提前问出来、好给一句人话而不是等第一条消息甩 traceback，以及打印
+        #   条数。多一次读，只发生在 CLI 启动时，不在服务热路径上。
         # ★ 顺序要紧：先 recover，再 reopen。
         #   recover 是纯读的，失败了库还和没跑过一样，可以原地重试；而
         #   reopen_session 是一个**承诺**——「我现在接管这个会话了」。不该在确认
@@ -88,14 +96,13 @@ def main() -> None:
         if not db.reopen_session(resume_sid):
             print(f"提示：会话 {resume_sid} 上次未正常退出（或正被另一个进程使用）",
                   file=sys.stderr)
-        agent = Agent(session_id=session_id, db=db, toolset=DEFAULT_TOOLSET,
-                      max_turns=settings.max_turns, initial_messages=history)
         print(f"恢复会话 {session_id}（{len(history)} 条历史）")
     else:
         session_id = db.create_session()
-        agent = Agent(session_id=session_id, db=db, toolset=DEFAULT_TOOLSET,
-                      max_turns=settings.max_turns)
         print(f"会话 {session_id}")
+
+    # 无状态 agent：不绑 session，构造一次、整个 REPL 复用。
+    agent = Agent(db=db, toolset=DEFAULT_TOOLSET, max_turns=settings.max_turns)
 
     print(f"mini-agent ({settings.model}) — 输入 'exit' 退出；"
           f"下次可用 --resume {session_id} 继续")
@@ -111,7 +118,7 @@ def main() -> None:
                 break
             if not user.strip():
                 continue
-            out = agent.run_conversation(user)
+            out = agent.run_conversation(session_id, user)
             print(out["final_response"])
     finally:
         # 正常退出 / Ctrl-C / 异常都走这里，把会话标记成结束

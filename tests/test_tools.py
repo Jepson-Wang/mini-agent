@@ -175,7 +175,7 @@ def test_get_definitions_check_fn_hides_unavailable(isolated_registry):
 # 3. agent 主循环接工具（M1）+ 每条消息落库（M2）
 # ---------------------------------------------------------------------------
 
-def test_agent_runs_tool_then_answers(isolated_registry, fake_llm):
+def test_agent_runs_tool_then_answers(isolated_registry, fake_llm, db):
     """完整一轮：模型发 tool_call → agent 执行 → 回填 → 模型据结果给文本答复。"""
     isolated_registry.register(
         name="echo", toolset="t", schema={"description": "echo"},
@@ -186,22 +186,22 @@ def test_agent_runs_tool_then_answers(isolated_registry, fake_llm):
         FakeMessage(content="结果是 hello"),
     ])
 
-    agent = Agent(toolset={"t"})
-    out = agent.run_conversation("说 hello")
+    agent = Agent(db=db, toolset={"t"})
+    out = agent.run_conversation("sess_1", "说 hello")
 
     assert out["completed"] is True
     assert out["final_response"] == "结果是 hello"
     assert out["used_turns"] == 2
 
     # 配对铁律：assistant(tool_calls) 后面紧跟 id 对应的 tool 消息
-    roles = [m.role for m in agent.messages]
-    assert roles == ["user", "assistant", "tool", "assistant"]
-    assert agent.messages[1].tool_calls[0].id == "call_1"
-    assert agent.messages[2].tool_call_id == "call_1"
-    assert json.loads(agent.messages[2].content) == {"echoed": "hello"}
+    history = db.recover("sess_1")
+    assert [m.role for m in history] == ["user", "assistant", "tool", "assistant"]
+    assert history[1].tool_calls[0].id == "call_1"
+    assert history[2].tool_call_id == "call_1"
+    assert json.loads(history[2].content) == {"echoed": "hello"}
 
 
-def test_agent_tool_error_does_not_crash_loop(isolated_registry, fake_llm):
+def test_agent_tool_error_does_not_crash_loop(isolated_registry, fake_llm, db):
     """工具抛异常时，模型收到的是 {"error":...} 回填，循环继续、能正常收尾。"""
     def boom(**kw):
         raise RuntimeError("炸了")
@@ -213,11 +213,11 @@ def test_agent_tool_error_does_not_crash_loop(isolated_registry, fake_llm):
         FakeMessage(content="工具失败了，我换个方式"),
     ])
 
-    agent = Agent(toolset={"t"})
-    out = agent.run_conversation("go")
+    agent = Agent(db=db, toolset={"t"})
+    out = agent.run_conversation("sess_1", "go")
 
     assert out["completed"] is True
-    tool_msg = agent.messages[2]
+    tool_msg = db.recover("sess_1")[2]
     assert tool_msg.role == "tool"
     assert "Tool failed" in json.loads(tool_msg.content)["error"]
 
@@ -236,8 +236,8 @@ def test_agent_persists_full_transcript(isolated_registry, fake_llm, tmp_path):
     db_file = str(tmp_path / "state.db")
     db = MiniSessionDB(db_file)
     sid = db.create_session()
-    agent = Agent(session_id=sid, db=db, toolset={"t"})
-    agent.run_conversation("go")
+    agent = Agent(db=db, toolset={"t"})
+    agent.run_conversation(sid, "go")
 
     # 新连接 = 新进程：只信磁盘
     revived = MiniSessionDB(db_file).recover(sid)
@@ -248,36 +248,61 @@ def test_agent_persists_full_transcript(isolated_registry, fake_llm, tmp_path):
     assert revived[3].content == "done"
 
 
-def test_initial_messages_seed_memory_without_rewriting_history(tmp_path):
-    """--resume 接线：initial_messages 只播种内存，绝不能把历史重新写一遍库。
+def test_running_an_existing_session_does_not_rewrite_its_history(fake_llm, db):
+    """对已有历史的 session 再跑一轮：历史只能往后增，绝不能被重写一遍。
 
-    recover 出来的消息本就是从库里读的。如果构造器拿它们走 _record，messages 表
-    会被整段历史重写一遍——seq 从 MAX+1 续着涨，行数翻倍，历史彻底乱套。所以
-    initial_messages 必须是直接赋值、不落库。这个测试就守着这条边界。
+    前身是 test_initial_messages_seed_memory_without_rewriting_history。那时
+    --resume 靠构造器的 initial_messages 播种内存，边界是"播种绝不能走 _record"。
+    无状态化后 initial_messages 没了、历史改由 run_conversation 内部 recover 取回，
+    但守的不变量一模一样：recover 出来的消息本就来自库，若被重新落库一遍，
+    seq 会从 MAX+1 续着涨、行数翻倍，历史彻底乱套。
     """
-    from mini_agent.persistence.session_db import MiniSessionDB
+    db.ensure_session("sess_1")
+    db.append_message("sess_1", Message(role="user", content="q1"))
+    db.append_message("sess_1", Message(role="assistant", content="a1"))
 
-    db_file = str(tmp_path / "state.db")
-    db = MiniSessionDB(db_file)
-    sid = db.create_session()
-    db.append_message(sid, Message(role="user", content="q1"))
-    db.append_message(sid, Message(role="assistant", content="a1"))
+    fake_llm([FakeMessage(content="a2")])
+    agent = Agent(db=db)
+    agent.run_conversation("sess_1", "q2")
 
-    before = db.conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE session_id = ?;", (sid,)
+    # 恰好多出 q2 + a2 两条，原有两条原封不动
+    assert [m.content for m in db.recover("sess_1")] == ["q1", "a1", "q2", "a2"]
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id = ?;", ("sess_1",)
     ).fetchone()[0]
+    assert n == 4
 
-    history = db.recover(sid)
-    agent = Agent(session_id=sid, db=db, initial_messages=history)
 
-    # 播种进了内存
-    assert [m.role for m in agent.messages] == ["user", "assistant"]
-    # 但库里一条都没多——构造器没有重新落库
-    after = db.conn.execute(
-        "SELECT COUNT(*) FROM messages WHERE session_id = ?;", (sid,)
-    ).fetchone()[0]
-    assert before == after == 2
+def test_retry_after_crash_mid_tool_turn_does_not_duplicate_the_user_message(
+    isolated_registry, db, monkeypatch
+):
+    """崩在**工具已执行之后**：历史以 tool 结尾，重试同样不该再插一条 user。
 
-    # 且拷了一份：改 agent.messages 不会反噬调用方传进来的 history
-    agent.messages.append(Message(role="user", content="q2"))
-    assert len(history) == 2
+    这一例专门盯着"末条是不是 user"那种朴素判据 —— 它在这里会漏判，插出
+    [user, assistant(tc), tool, user] 这种更难看的东西。正确的判据是
+    「末条是不是纯文本 assistant」，也就是主循环自己的终止条件。
+    """
+    isolated_registry.register(name="echo", toolset="t",
+                               schema={"description": "x"},
+                               handler=lambda text: {"echoed": text})
+    calls = {"n": 0}
+
+    def flaky(messages, tools=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _tool_call_msg("call_1", "echo", {"text": "hi"})
+        if calls["n"] == 2:
+            raise RuntimeError("LLM 超时")          # 工具已跑完、结果已落库
+        return FakeMessage(content="done")
+
+    monkeypatch.setattr("mini_agent.agent.call_llm", flaky)
+    agent = Agent(db=db, toolset={"t"})
+
+    with pytest.raises(RuntimeError):
+        agent.run_conversation("sess_1", "说 hi")
+
+    agent.run_conversation("sess_1", "说 hi")        # 调用方重试
+
+    history = db.recover("sess_1")
+    assert [m.role for m in history] == ["user", "assistant", "tool", "assistant"]
+    assert [m.content for m in history].count("说 hi") == 1

@@ -10,6 +10,18 @@ from typing import Any
 import pytest
 
 
+@pytest.fixture
+def db(tmp_path):
+    """一个独立的临时库。
+
+    Agent 无状态化后 db 是**必需**依赖（会话历史的唯一真相在库里），所以连纯粹
+    测循环逻辑的用例也得有它。test_persistence.py 有自己的同名 fixture，就近覆盖。
+    """
+    from mini_agent.persistence.session_db import MiniSessionDB
+
+    return MiniSessionDB(str(tmp_path / "state.db"))
+
+
 class FakeMessage:
     """模拟 openai SDK 返回的 message 对象（鸭子类型：有 .content / .tool_calls）。"""
 

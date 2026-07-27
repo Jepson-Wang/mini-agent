@@ -108,6 +108,45 @@ def test_create_session_and_exists(db):
     assert db.session_exists("sess_does_not_exist") is False
 
 
+def test_ensure_session_lets_an_externally_minted_id_take_messages(db):
+    """外部（Go）铸造的 session_id，ensure 之后必须能直接写消息。
+
+    这是 ensure_session 存在的**唯一理由**：messages.session_id 有外键指向
+    sessions，且 PRAGMA foreign_keys=ON。Go 那边「有」这个 session ≠ 我们库里
+    「有」——不先补上这一行，首次 append_message 必然 IntegrityError。
+    """
+    sid = "sess_minted_by_go"
+
+    assert db.ensure_session(sid) is True        # 新建
+    assert db.session_exists(sid) is True
+    db.append_message(sid, Message(role="user", content="hi"))   # 不该炸
+
+    assert [m.content for m in db.recover(sid)] == ["hi"]
+
+
+def test_ensure_session_is_idempotent(db):
+    """重复 ensure 不新增行、不改动已有行 —— 每一轮对话开头都会调它。"""
+    sid = "sess_minted_by_go"
+    db.ensure_session(sid)
+    db.append_message(sid, Message(role="user", content="hi"))
+
+    assert db.ensure_session(sid) is False       # 第二次不是新建
+    assert db.ensure_session(sid) is False
+
+    n = db.conn.execute(
+        "SELECT COUNT(*) FROM sessions WHERE session_id = ?;", (sid,)
+    ).fetchone()[0]
+    assert n == 1
+    # 已有历史不能被 ensure 冲掉
+    assert [m.content for m in db.recover(sid)] == ["hi"]
+
+
+def test_ensure_session_rejects_empty_id(db):
+    """空 id 是调用方的编程错误，当场报出来，别静默建一行垃圾。"""
+    with pytest.raises(PersistenceError):
+        db.ensure_session("")
+
+
 def test_end_session_marks_done(db):
     sid = db.create_session()
     row = db.conn.execute(

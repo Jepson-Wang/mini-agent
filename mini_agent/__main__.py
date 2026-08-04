@@ -23,7 +23,7 @@ from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
 
 # 默认工具集。web_fetch 另受 ALLOW_WEB 门控（没开就不会暴露给模型）；
 # file 工具目前还没实现，写好后会自动出现在这个集合里。
-DEFAULT_TOOLSET = {"file", "web"}
+DEFAULT_TOOLSET = {"file", "web","math"}
 
 
 def _db_path() -> str:

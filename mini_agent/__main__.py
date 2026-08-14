@@ -18,18 +18,8 @@ from __future__ import annotations
 import sys
 
 from mini_agent.agent import Agent
-from mini_agent.config import settings
+from mini_agent.config import DEFAULT_TOOLSET, settings
 from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
-
-# 默认工具集。web_fetch 另受 ALLOW_WEB 门控（没开就不会暴露给模型）；
-# file 工具目前还没实现，写好后会自动出现在这个集合里。
-DEFAULT_TOOLSET = {"file", "web","math"}
-
-
-def _db_path() -> str:
-    """<settings.home>/state.db；目录不存在先建。默认落在项目根的 .mini_agent/。"""
-    settings.home.mkdir(parents=True, exist_ok=True)
-    return str(settings.home / "state.db")
 
 
 def _parse_resume(argv: list[str]) -> str | None:
@@ -53,10 +43,10 @@ def main() -> None:
     # 损坏要到第一条 PRAGMA 才暴露）。持久化层已把这些收敛成 PersistenceError，
     # 这里接住给一句人话，而不是甩一坨 traceback。
     try:
-        db = MiniSessionDB(_db_path())
+        db = MiniSessionDB(settings.db_path())
     except PersistenceError as e:
         print(f"无法打开数据库：{e}\n"
-              f"位置：{_db_path()}\n"
+              f"位置：{settings.db_path()}\n"
               f"若确认这个文件已损坏，删掉它即可重新开始（会丢失全部历史会话）。",
               file=sys.stderr)
         sys.exit(1)
@@ -85,7 +75,7 @@ def main() -> None:
             # 实际在开新的，而新消息还会以 seq 接着写进同一个 session，把库里那段
             # transcript 变成两段无关对话的拼接，事后无法分辨。
             print(f"无法恢复会话 {resume_sid}：{e}\n"
-                  f"这段历史仍在库里（{_db_path()}），没有被改动。\n"
+                  f"这段历史仍在库里（{settings.db_path()}），没有被改动。\n"
                   f"可以直接 `python -m mini_agent` 开一个新会话继续工作。",
                   file=sys.stderr)
             sys.exit(1)

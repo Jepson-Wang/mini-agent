@@ -16,16 +16,33 @@
 """
 from __future__ import annotations
 
+import json
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from mini_agent.llm import call_llm
+from mini_agent.log import get_logger
 from mini_agent.schema import Message
 from mini_agent.tools.registry import registry, discover_builtin_tools
 
 if TYPE_CHECKING:
     from mini_agent.persistence.session_db import MiniSessionDB
+
+logger = get_logger(__name__)
+
+
+class TaskCancelled(Exception):
+    """外部要求中止本次 run_conversation（gRPC 的 CancelTask / 客户端断开）。
+
+    刻意用异常而不是返回 `completed=False`：后者已经被"预算耗尽"占用了，
+    两种结局混在一个返回值里，调用方就分不出"跑不完"和"被叫停"——而这两件事
+    对上游意味着完全不同的东西（前者是失败，后者是用户自己要的）。
+    """
+
+
+# 被取消的回合在 transcript 上的封口标记，见 _seal_cancelled_turn。
+CANCELLED_MARKER = "(上一轮任务被取消，未完成)"
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are mini-agent, a helpful AI assistant with access to tools.\n"
@@ -92,10 +109,21 @@ class _Turn:
     无状态化的关键：session_id 和 messages 从**实例字段**降级成**调用局部变量**。
     它俩必须一起拆走 —— 只把 session_id 改成传参、messages 还挂在 self 上的话，
     第二个 session 会读到第一个残留的历史，比原来更糟。
+
+    on_event / cancel_check 同理，**必须挂在这里而不是 Agent 实例上**：一个实例
+    并发服务多个 session，挂实例上就等于把 A 的事件推给了 B 的流、用 B 的取消
+    信号停掉 A 的任务。
     """
 
     session_id: str
     messages: list[Message]
+
+    # 进度回调：(event_type, payload) -> None。gRPC 那侧把它塞进事件队列变成
+    # TaskEvent 流。None = 没人听（CLI、测试），所有 _emit 直接空转。
+    on_event: Optional[Callable[[str, str], None]] = None
+
+    # 取消探针：返回 True 表示"别跑了"。在每个可中断的点被调用，见 _check_cancelled。
+    cancel_check: Optional[Callable[[], bool]] = None
 
 
 class Agent:
@@ -132,6 +160,69 @@ class Agent:
     def system_dict(self) -> dict:
         return {"role": "system", "content": self.system_prompt}
 
+    # ---------- 内部：进度上报 + 取消 ----------
+
+    @staticmethod
+    def _emit(turn: _Turn, event_type: str, payload: str) -> None:
+        """尽力上报一条进度事件。**永不抛异常。**
+
+        进度是旁路，不是主线：观察者（gRPC 事件队列）出问题不该让一个正在跑的
+        任务失败 —— 那等于让"看任务的人"有权杀掉任务。同 registry.dispatch 的取向。
+        真要停，走 cancel_check 那条明路。
+        """
+        if turn.on_event is None:
+            return
+        try:
+            turn.on_event(event_type, payload)
+        except Exception:
+            logger.exception(
+                "on_event 回调抛异常，已忽略 session=%s type=%s",
+                turn.session_id, event_type,
+            )
+
+    @staticmethod
+    def _check_cancelled(turn: _Turn) -> None:
+        """到取消点了就抛 TaskCancelled。cancel_check 自己抛异常视为"不取消"。
+
+        探针是外部传进来的代码，它坏掉不该被解读成"用户要取消" —— 那是在最坏的
+        方向上猜。记一条日志继续跑，任务顶多多活到下一个探针点或自然结束。
+        """
+        if turn.cancel_check is None:
+            return
+        try:
+            cancelled = turn.cancel_check()
+        except Exception:
+            logger.exception("cancel_check 抛异常，按未取消处理 session=%s", turn.session_id)
+            return
+        if cancelled:
+            raise TaskCancelled(f"session={turn.session_id} 收到取消信号")
+
+    def _seal_cancelled_turn(self, turn: _Turn) -> None:
+        """给被取消的回合在 transcript 上封口，让它不再看起来像"跑了一半"。
+
+        ★ 少了这一步会静默丢用户输入。 _turn_in_flight 的判据是"末条不是纯文本
+        assistant"，它原本只可能由**崩溃**造成，所以推断"调用方在重试、用户那句话
+        早已落库"是对的。取消打破了这个前提：取消之后同一个 session 的下一个任务
+        带的是**全新的用户输入**，却会被当成重试而不予记录 —— 用户换了个问题，
+        模型接着答上一个被取消的问题，而新问题永远丢了。
+
+        封口的方式是补一条纯文本 assistant：
+          - 纯文本（不带 tool_calls）正是主循环的正常终止形态，_turn_in_flight
+            据此判定"这回合结束了"，下一轮的用户输入就能正常落库；
+          - 内容如实写明被取消，下一轮模型看得见"上一件事被叫停了"，这本就是它
+            该有的上下文；
+          - 残缺的 tool 配对不必在这里补 —— 下一轮 recover 会按 tool_call_id
+            统一补桩，补出来的位置紧跟在 assistant(tool_calls) 后面，仍然合法，
+            这条封口消息排在它们之后。
+
+        写库失败只记日志、不抛：这条路径本身是在处理取消，再抛一个新异常只会把
+        "任务被取消了"这个真正的结局盖掉。
+        """
+        try:
+            self._record(turn, Message(role="assistant", content=CANCELLED_MARKER))
+        except Exception:
+            logger.exception("给被取消的回合封口时写库失败 session=%s", turn.session_id)
+
     # ---------- 内部：落库 + 工具 ----------
 
     def _record(self, turn: _Turn, msg: Message) -> None:
@@ -167,19 +258,48 @@ class Agent:
         recover 能按 tool_call_id 从幂等表查回真结果补桩，不必重跑有副作用的工具。
         result 包成 {"content": result} 是因为 dispatch 返回的是裸字符串（不一定是
         JSON），而幂等表按 dict 存、recover 按 cached["content"] 取——两头必须对齐。
+
+        ★ 取消点在 dispatch **之前**，一个都不放在之后。 在这里中断会留下一轮
+        配对残缺的 transcript（assistant 有 tool_calls，tool 结果缺几条），那正是
+        recover / _sanitize_dangling_tool_calls 每轮开头都在处理的情况，安全。
+        但取消点若放在 dispatch 之后、record 之前，就等于"工具跑了、结果扔了"——
+        对有副作用的工具，下次 recover 只能从幂等表捞，捞不到就得重跑。放前面则
+        这个工具压根没启动过，没有任何东西需要善后。
         """
         for tc in assistant.tool_calls:
+            self._check_cancelled(turn)
+            self._emit(turn, "tool_call", json.dumps(
+                {"id": tc.id, "name": tc.name, "arguments": tc.arguments},
+                ensure_ascii=False,
+            ))
             result = registry.dispatch(tc.name, tc.arguments)
             self.db.record_executed_key(tc.id, turn.session_id, {"content": result})
             self._record(turn, Message(role="tool", tool_call_id=tc.id, content=result))
+            self._emit(turn, "tool_result", json.dumps(
+                {"id": tc.id, "name": tc.name, "content": result},
+                ensure_ascii=False,
+            ))
 
     # ---------- 主循环 ----------
 
-    def run_conversation(self, session_id: str, user_message: str) -> dict:
+    def run_conversation(
+        self,
+        session_id: str,
+        user_message: str,
+        *,
+        on_event: Optional[Callable[[str, str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
+    ) -> dict:
         """跑一轮用户输入到最终文本回复。返回 {final_response, completed, used_turns}。
 
         session_id 由调用方给（Go 铸造、经 gRPC 传入；CLI 自己 mint），本方法不
         持有它 —— 这正是"一个实例服务所有 session"的前提。
+
+        on_event / cancel_check 也是**每次调用**给的，理由同上：实例是共享的，
+        这两个钩子却是一个任务私有的。两者都可以不给（CLI、测试就不给），
+        此时行为与加钩子之前逐字节一致。
+
+        被取消时抛 TaskCancelled（不是返回值），见该异常的说明。
 
         起手三步：
           1. ensure_session —— 幂等补上 sessions 行。Go 那边"有"这个 session 不等于
@@ -189,7 +309,8 @@ class Agent:
              就被免费处理掉了。新 session 返回 []，于是新建/续跑两条路合并成一条。
           3. 记下用户这句话 —— 除非上一回合没跑完（见 _turn_in_flight）。那说明
              这次是调用方在重试，用户那句话早已落库，再记一遍就重复了；此时直接
-             从补桩后的历史续跑。
+             从补桩后的历史续跑。**取消不会走到这条分支**：被取消的回合在退出前
+             就被 _seal_cancelled_turn 封了口，所以下一个任务的新输入照常记录。
 
         终止：模型返回纯文本（不带 tool_calls）即完成。
         失控保护：IterationBudget 到顶后，再给最后一次"不带 tools"的收尾调用，
@@ -197,15 +318,37 @@ class Agent:
         """
         self.db.ensure_session(session_id)
         history = self.db.recover(session_id)
-        turn = _Turn(session_id=session_id, messages=history)
+        turn = _Turn(
+            session_id=session_id,
+            messages=history,
+            on_event=on_event,
+            cancel_check=cancel_check,
+        )
 
         if not _turn_in_flight(history):
             self._record(turn, Message(role="user", content=user_message))
 
+        try:
+            return self._run_loop(turn)
+        except TaskCancelled:
+            # 封口后原样上抛：调用方要的是"被取消"这个结局，不是一个返回值。
+            self._seal_cancelled_turn(turn)
+            raise
+
+    def _run_loop(self, turn: _Turn) -> dict:
+        """主循环本体。从 run_conversation 拆出来，只为让取消能包一层 try。"""
         budget = IterationBudget(self.max_turns)
         while budget.consume():
+            # 循环顶是最主要的取消点：此时 transcript 处于完整可发送状态，
+            # 中断不留任何需要 recover 善后的残缺轮。
+            self._check_cancelled(turn)
             assistant = self._call_model(turn, self._tool_defs())
             self._record(turn, assistant)
+
+            # 带 tool_calls 时 content 是模型的"我打算干什么"，纯文本时它就是
+            # 最终答案 —— 后者由 finished 事件带走，这里只报前者，避免重复推送。
+            if assistant.content and assistant.tool_calls:
+                self._emit(turn, "thinking", assistant.content)
 
             if not assistant.tool_calls:
                 return {

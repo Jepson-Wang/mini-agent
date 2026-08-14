@@ -28,6 +28,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # （对照 Hermes：它放 ~/.hermes，因为它是跨项目共享的全局 CLI 工具。）
 DEFAULT_HOME = PROJECT_ROOT / ".mini_agent"
 
+# 默认工具集。web_fetch 另受 ALLOW_WEB 门控（没开就不会暴露给模型）。
+#
+# ★ 放在这里而不是某个 surface 里：CLI 和 gRPC server 是两个平级入口，谁持有它
+#   另一个就得 import 对方。尤其不能留在 __main__.py —— `python -m mini_agent`
+#   会让那个文件同时以 `__main__` 和 `mini_agent.__main__` 两个身份存在，import
+#   它等于把整个 CLI 再执行一遍。两边各抄一份则更糟：改了一处，另一个 surface
+#   的模型权限静默不同步。
+DEFAULT_TOOLSET = {"file", "web", "math"}
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -37,6 +46,18 @@ class Settings:
     max_turns: int = 25                 # IterationBudget 默认上限（主 agent）
     request_timeout: float = 120.0      # 单次 LLM 调用超时（秒）；SDK 默认 600s 太长
     home: Path = DEFAULT_HOME           # 运行时状态根目录，见上
+
+    # ---- gRPC surface（mini_agent/grpcserver）----
+    grpc_port: int = 50051              # 要和 Go 那边的 AGENT_ADDR 对上
+    # 并发上限。一个任务占**两个**线程：gRPC 的 handler 线程（跑生成器、发事件）
+    # 和它拉起的 worker 线程（跑 run_conversation）。所以这个数是"同时在跑的任务
+    # 数"的上限，不是它的两倍。
+    grpc_max_workers: int = 16
+
+    def db_path(self) -> str:
+        """<home>/state.db；目录不存在先建。CLI 和 gRPC server 共用同一个库。"""
+        self.home.mkdir(parents=True, exist_ok=True)
+        return str(self.home / "state.db")
 
 
 def _num_env(name: str, default, cast):
@@ -67,6 +88,8 @@ def _load_settings() -> Settings:
         max_turns=_num_env("MINI_AGENT_MAX_TURNS", 25, int),
         request_timeout=_num_env("MINI_AGENT_REQUEST_TIMEOUT", 120.0, float),
         home=Path(os.getenv("MINI_AGENT_HOME", DEFAULT_HOME)).expanduser(),
+        grpc_port=_num_env("MINI_AGENT_GRPC_PORT", 50051, int),
+        grpc_max_workers=_num_env("MINI_AGENT_GRPC_MAX_WORKERS", 16, int),
     )
 
 

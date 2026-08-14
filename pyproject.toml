@@ -7,6 +7,8 @@ dependencies = [
     "openai>=1.40",        # DeepSeek 用 OpenAI 兼容 SDK（base_url 指向 api.deepseek.com）
     "pydantic>=2.7",
     "python-dotenv>=1.0",
+    "grpcio>=1.60",        # gRPC surface（mini_agent/grpcserver）的运行时
+    "grpcio-tools>=1.60",  # protoc + 插件；改了 .proto 要用它重新生成 mini_agent/gen/
 ]
 
 [project.optional-dependencies]
@@ -19,8 +21,12 @@ dev = [
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["mini_agent"]
+[tool.setuptools.packages.find]
+# 必须用 find 而不是写死 packages = ["mini_agent"]：那样只装顶层那一个包，
+# mini_agent.tools / .persistence / .grpcserver / .gen 全都不会被打进去，
+# 装完 import 就报 ModuleNotFoundError。editable 安装碰巧看不出来（它把整个
+# 源码树映射进去），所以这个坑只在真正打包分发时才炸。
+include = ["mini_agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

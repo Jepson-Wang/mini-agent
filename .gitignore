@@ -23,6 +23,14 @@ venv/
 .coverage
 htmlcov/
 
+# gRPC 生成代码：protoc 的产物，源头是 mini_agent/proto/ 下的 .proto。
+# 目录结构靠 mini_agent/gen/ 下手写的 __init__.py 保留（那几个是要入库的，
+# 里面有 sys.path 补丁），只忽略生成出来的文件本身。
+# 重新生成见 README 的「protoc」一节。
+*_pb2.py
+*_pb2.pyi
+*_pb2_grpc.py
+
 # IDE
 .idea/
 .vscode/

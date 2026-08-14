@@ -1,0 +1,70 @@
+syntax = "proto3";
+
+package agent.v1;
+
+option go_package = "github.com/Jepson-Wang/mini_agent_backend/gen/agent/v1;agentv1";
+
+service AgentService {
+  // RunTask 发起一个任务。服务端流式:任务跑的过程中按顺序推事件回来,
+  // 跑完了就把流关掉(客户端看到 EOF)。
+  rpc RunTask(RunTaskRequest) returns (stream TaskEvent);
+
+  // CancelTask 让 Agent 别跑了。一元调用,而且是 best-effort ——
+  // backend 是先把 canceled 落库、再来通知的,通知失败不影响任务状态。
+  rpc CancelTask(CancelTaskRequest) returns (CancelTaskResponse);
+
+  // Health 探活。
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message RunTaskRequest {
+  string task_uid   = 1;
+  string session_id = 2;
+  string input      = 3;
+  // trace_id 一路透传,别断链路。
+  string trace_id   = 4;
+}
+
+message CancelTaskRequest {
+  string task_uid = 1;
+  // reason 是用户填的取消理由,可能是空串(没填)。
+  string reason   = 2;
+  string trace_id = 3;
+}
+
+message CancelTaskResponse {
+  bool cancelled = 1;
+  // message 在 cancelled=false 时说明为什么取消不了。
+  // 客户端会把它带进错误里 —— 这是唯一能解释失败原因的地方,别留空。
+  string message = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ok        = 1;
+  string version = 2;
+}
+
+message TaskEvent {
+  // task_uid 必须和 RunTaskRequest 里的一致。客户端会核对,对不上就丢弃。
+  string task_uid  = 1;
+  EventType type   = 2;
+  // seq 单调递增,从 1 开始,用来排序和去重。
+  int64 seq        = 3;
+  // payload 是这条事件的内容:思考文本、工具调用参数、错误原因……
+  // 按 type 解释。空的话这条事件基本没有信息量。
+  string payload   = 4;
+  // timestamp 是 Unix 毫秒。
+  int64 timestamp  = 5;
+}
+
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  EVENT_TYPE_STARTED     = 1;
+  EVENT_TYPE_THINKING    = 2;
+  EVENT_TYPE_TOOL_CALL   = 3;
+  EVENT_TYPE_TOOL_RESULT = 4;
+  EVENT_TYPE_FINISHED    = 5;
+  EVENT_TYPE_ERROR       = 6;
+}

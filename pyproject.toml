@@ -40,3 +40,14 @@ markers = [
     #   pytest -m slow         单独跑崩溃恢复
     "slow: 需要拉子进程的慢测试（真 kill 崩溃恢复）",
 ]
+# 放这里而不是 CI 命令行里：本地和 CI 跑的必须是同一条命令，否则"本地绿 CI 红"无从对照。
+#
+# -ra：汇总里列出所有 skip / xfail 及其原因。xfail 是"已知坏着"的显式声明，
+#      不能让它安静地躺在那里没人看见。
+# --strict-markers：未注册的 marker 直接报错。不加的话 @pytest.mark.slwo 只是个警告，
+#      那条慢测试就会悄悄混进 -m "not slow"，CI 的 fast / slow 划分随之失真。
+addopts = ["-ra", "--strict-markers"]
+# 单个测试跑超过 120s 就把所有线程的栈 dump 出来。
+# ★ 它只 dump、不杀进程——作用是"卡住时一眼看到卡在哪"，不是止损。
+#   止损靠 CI job 的 timeout-minutes；本地卡住就 Ctrl+C。
+faulthandler_timeout = 120

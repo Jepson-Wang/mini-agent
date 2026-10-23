@@ -7,15 +7,19 @@
   所有路径都先 resolve()（会展开 .. 和符号链接），再校验它没有逃出工作区根目录。
   越界的一律拒绝。这就是 web_fetch 那套「解析后校验目标」在文件系统上的翻版。
 
-工作区根目录：环境变量 MINI_AGENT_WORKSPACE，默认是启动时的当前目录。
+工作区根目录由 config.workspace_root() 给出：环境变量 MINI_AGENT_WORKSPACE，
+默认 <home>/workspace ——**不是启动时的当前目录**。这一条至关重要：沙箱边界
+再严，根目录设成 cwd 也白搭，因为项目通常就是从仓库根启动的，.env 正好落在
+沙箱里，上面那句 read_file('.env') 会原样成立。理由详见 config.DEFAULT_WORKSPACE_NAME。
+
 读写只用标准库（pathlib），不引入任何依赖。
 """
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
+from mini_agent.config import workspace_root
 from mini_agent.log import get_logger
 from mini_agent.tools.registry import registry
 
@@ -40,12 +44,27 @@ def _err(message: str) -> str:
 # 沙箱：所有路径都必须落在工作区根目录内
 # ---------------------------------------------------------------------------
 
-def _workspace_root() -> Path:
-    """工作区根目录。每次调用都现算，好让测试能用 env 临时改。"""
-    raw = os.getenv("MINI_AGENT_WORKSPACE") or os.getcwd()
-    root = Path(raw).resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+def _root() -> Path:
+    """工作区根目录，失败翻成 FileToolError。
+
+    config.workspace_root() 会 mkdir，而 mkdir 会抛 OSError（父路径是个文件、
+    权限不足、磁盘满……）。不翻的话这个裸异常会一路穿过 read_file ——
+    而本模块的契约是"错误一律是 {"error": ...} 的合法 JSON"。
+
+    更要紧的是**错误信息里那条绝对路径**。registry.dispatch 会把异常文本包成
+    Tool failed: ... 回给模型，那段文本跟着 tool_result 事件流到 Go、写进任务
+    详情、最后回显给用户。`_rel()` 存在的全部理由就是不让绝对路径漏给模型，
+    这条路径等于从后门把它送了出去。所以对外只给一句不含路径的话，
+    真实原因（含路径）只进本地日志。
+    """
+    try:
+        return workspace_root()
+    except OSError as e:
+        logger.error("工作区根目录不可用: %s: %s", type(e).__name__, e)
+        raise FileToolError(
+            f"工作区根目录不可用（{type(e).__name__}）。这是部署环境的问题，"
+            f"不是这次调用的参数问题，换个路径重试没有用。"
+        ) from e
 
 
 def _resolve_in_workspace(path: str) -> Path:
@@ -59,7 +78,7 @@ def _resolve_in_workspace(path: str) -> Path:
     """
     if not path or not str(path).strip():
         raise FileToolError("path 不能为空")
-    root = _workspace_root()
+    root = _root()
     candidate = (root / path).resolve()
     if candidate != root and not candidate.is_relative_to(root):
         raise FileToolError(
@@ -69,11 +88,16 @@ def _resolve_in_workspace(path: str) -> Path:
 
 
 def _rel(p: Path) -> str:
-    """把绝对路径显示成相对工作区的形式，不向模型泄露绝对路径。"""
+    """把绝对路径显示成相对工作区的形式，不向模型泄露绝对路径。
+
+    兜底返回文件名而不是 str(p)：走到这里说明这个路径**算不出**相对形式
+    （根目录没了、或者它压根不在根下面），那正是最不该把绝对路径吐出去的时候。
+    只给个文件名，模型认得出是哪个文件，也不会知道它在磁盘的哪儿。
+    """
     try:
-        return str(p.relative_to(_workspace_root())).replace("\\", "/")
-    except ValueError:
-        return str(p)
+        return str(p.relative_to(_root())).replace("\\", "/")
+    except (ValueError, FileToolError):
+        return p.name
 
 
 # ---------------------------------------------------------------------------

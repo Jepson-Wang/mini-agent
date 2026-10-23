@@ -20,7 +20,14 @@ import pytest
 import mini_agent.agent as agent_mod
 from mini_agent.agent import Agent, CANCELLED_MARKER
 from mini_agent.gen.agent.v1 import agent_pb2, agent_pb2_grpc
-from mini_agent.grpcserver.server import AgentServicer
+from mini_agent.persistence.session_db import PersistenceError
+from mini_agent.grpcserver.server import (
+    AgentServicer,
+    _AUTH_METADATA_KEY,
+    _TokenAuthInterceptor,
+    _bind_target,
+    _is_loopback,
+)
 from mini_agent.tools.registry import registry
 
 
@@ -59,10 +66,13 @@ def serve(db, monkeypatch):
     """
     servers = []
 
-    def _make(llm, max_turns: int = 25):
+    def _make(llm, max_turns: int = 25, token: str = ""):
         monkeypatch.setattr("mini_agent.agent.call_llm", llm)
         agent = Agent(db=db, toolset={"grpctest"}, max_turns=max_turns)
-        server = grpc.server(futures.ThreadPoolExecutor(max_workers=8))
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=8),
+            interceptors=[_TokenAuthInterceptor(token)] if token else [],
+        )
         agent_pb2_grpc.add_AgentServiceServicer_to_server(AgentServicer(agent), server)
         port = server.add_insecure_port("127.0.0.1:0")
         server.start()
@@ -404,3 +414,217 @@ def endless_tools(delay: float = 0.4):
         )
 
     return _call
+
+
+# ---------------------------------------------------------------------------
+# 鉴权（安全关键：这个 surface 的权限比 Go 那侧的 /internal 还大）
+# ---------------------------------------------------------------------------
+
+TOKEN = "t" * 32
+
+
+def _md(token: str) -> list:
+    return [(_AUTH_METADATA_KEY, token)]
+
+
+def test_auth_rejects_missing_token(serve):
+    """配了密钥就必须带。不带 = UNAUTHENTICATED，不是"当没配处理"。"""
+    stub, _ = serve(iter_llm([]), token=TOKEN)
+    with pytest.raises(grpc.RpcError) as e:
+        stub.Health(agent_pb2.HealthRequest())
+    assert e.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+def test_auth_rejects_wrong_token(serve):
+    stub, _ = serve(iter_llm([]), token=TOKEN)
+    with pytest.raises(grpc.RpcError) as e:
+        stub.Health(agent_pb2.HealthRequest(), metadata=_md("x" * 32))
+    assert e.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+def test_auth_accepts_correct_token(serve):
+    stub, _ = serve(iter_llm([]), token=TOKEN)
+    assert stub.Health(agent_pb2.HealthRequest(), metadata=_md(TOKEN)).ok is True
+
+
+def test_auth_covers_runtask_not_just_health(serve):
+    """流式方法也要拦住。
+
+    单独测是因为拦截器拒绝时返回的是 unary_unary handler —— 方法类型对不上，
+    值得确认它对服务端流式同样有效（成立的原因是 abort 直接抛异常）。
+    真正危险的也是这个方法：它能跑任意任务、读写工作区、烧 LLM 额度。
+    """
+    stub, _ = serve(iter_llm([]), token=TOKEN)
+    stream = stub.RunTask(agent_pb2.RunTaskRequest(task_uid="t1", session_id="s1", input="hi"))
+    with pytest.raises(grpc.RpcError) as e:
+        list(stream)
+    assert e.value.code() == grpc.StatusCode.UNAUTHENTICATED
+
+
+def test_auth_error_does_not_echo_the_token(serve):
+    """拒绝信息里不能出现收到的值 —— 那等于把别人贴错的真密钥写进日志/响应。"""
+    wrong = "hunter2hunter2hunter2hunter2hunt"
+    stub, _ = serve(iter_llm([]), token=TOKEN)
+    with pytest.raises(grpc.RpcError) as e:
+        stub.Health(agent_pb2.HealthRequest(), metadata=_md(wrong))
+    assert wrong not in e.value.details()
+    assert TOKEN not in e.value.details()
+
+
+# ---------------------------------------------------------------------------
+# 监听地址 / 密钥策略
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("host,loopback", [
+    ("127.0.0.1", True),
+    ("127.0.0.2", True),      # 整个 127/8 都只对本机可达，不能只认 127.0.0.1
+    ("::1", True),
+    ("localhost", True),
+    ("0.0.0.0", False),
+    ("::", False),
+    ("192.168.1.10", False),
+    ("agent.internal", False),   # 解析不出来的按"对外可达"处理
+])
+def test_is_loopback(host, loopback):
+    assert _is_loopback(host) is loopback
+
+
+def test_bind_target_brackets_ipv6():
+    """IPv6 字面量不套方括号的话，冒号会被当成 host/port 分隔符。"""
+    assert _bind_target("127.0.0.1", 50051) == "127.0.0.1:50051"
+    assert _bind_target("::", 50051) == "[::]:50051"
+    assert _bind_target("::1", 50051) == "[::1]:50051"
+
+
+def test_serve_refuses_public_bind_without_token(monkeypatch):
+    """往外绑但没配密钥 → 拒绝启动。不能"能跑但没防护"。"""
+    from mini_agent.grpcserver import server as srv
+
+    with pytest.raises(SystemExit) as e:
+        srv.serve(host="0.0.0.0", token="")
+    assert "MINI_AGENT_GRPC_TOKEN" in str(e.value)
+
+
+def test_serve_refuses_short_token(monkeypatch):
+    """填了个短的比没填更危险：会让人以为已经防住了。"""
+    from mini_agent.grpcserver import server as srv
+
+    with pytest.raises(SystemExit) as e:
+        srv.serve(host="0.0.0.0", token="short")
+    assert "short" not in str(e.value)      # 别把密钥写进启动日志
+    assert "至少" in str(e.value)
+
+
+# ---------------------------------------------------------------------------
+# Health 自检
+# ---------------------------------------------------------------------------
+
+def _break_db(monkeypatch, agent, message="数据库自检: 磁盘故障"):
+    """让这个 agent 的库自检失败。
+
+    刻意**不**去 close 真的 sqlite 连接。试过，会污染后面的用例：一个被关掉的
+    连接留在 fixture 对象上，等它在下一个用例执行期间被 GC，同进程里正在跑的
+    其它 sqlite 调用会零星拿到 InterfaceError（"bad parameter or other API
+    misuse"）—— 表现是 test_different_sessions_run_concurrently 约五次一挂，
+    而且挂在一个和本次改动毫无关系的地方。
+
+    这里要测的本来也不是 sqlite 怎么坏的，而是**坏了之后 Health 怎么报**。
+    ping() 自己抛不抛 PersistenceError 由 test_persistence.py 单独盯。
+    """
+    def boom():
+        raise PersistenceError(message)
+
+    monkeypatch.setattr(agent.db, "ping", boom)
+
+
+def test_health_reports_not_ok_when_db_is_down(serve, monkeypatch):
+    """库用不了时 ok 必须变 False。
+
+    硬编码 ok=True 的话，Go 那侧"问到了、它说自己不好"这个状态永远产生不了，
+    /health 的 agent 字段实际只有 up / 不可达两态 —— 那个区分就是摆设。
+    """
+    stub, agent = serve(iter_llm([]))
+    assert stub.Health(agent_pb2.HealthRequest()).ok is True
+
+    _break_db(monkeypatch, agent)
+    assert stub.Health(agent_pb2.HealthRequest()).ok is False
+
+
+def test_health_does_not_echo_db_error(serve, monkeypatch):
+    """自检失败的细节只留在本地日志，不跟着响应出去 —— 那条路径是对外的。
+
+    Go 那侧的 TestHealth_ProbeErrorNotEchoed 盯的是同一条不变量的下半段：
+    /health 是通常不鉴权的接口，错误原文里往往带着路径和地址。
+    """
+    stub, agent = serve(iter_llm([]))
+    secret_path = "/srv/prod/.mini_agent/state.db"
+    _break_db(monkeypatch, agent, f"数据库自检: 打不开 {secret_path}")
+
+    resp = stub.Health(agent_pb2.HealthRequest())
+    assert resp.ok is False
+    assert resp.version                  # 版本照常给，运维要靠它对齐
+    assert secret_path not in str(resp)  # 但失败细节不给
+
+
+# ---------------------------------------------------------------------------
+# 密钥的字符集和长度（这一层踩过：合法长度 + 非 ASCII = 服务静默不可用）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad,why", [
+    ("密钥" * 20,                          "中文：len()=40 过了长度关，但 metadata 只收 ASCII"),
+    ("0123456789abcdef 0123456789abcde",   "含空格：头部里合法，但会被两端的修剪吃掉"),
+    ("0123456789abcdef\t0123456789abcde",  "含制表符"),
+    ("0123456789abcdef\n0123456789abcde",  "含换行：还能伪造头部"),
+])
+def test_serve_refuses_non_ascii_token(bad, why):
+    """非可见 ASCII 的密钥必须在**启动时**被拒。
+
+    不拒的话失败形态极其难查：配置校验放行、服务正常启动、日志一切正常，
+    然后每一次调用都在传输层被打回来 ——
+
+        Metadata value for key x-agent-token is invalid: Illegal header value
+        → 客户端拿到 INTERNAL / "Invalid metadata"
+
+    日志里没有任何东西指向密钥格式。实测确认过这个行为，不是推测。
+    """
+    from mini_agent.grpcserver import server as srv
+
+    with pytest.raises(SystemExit) as e:
+        srv.serve(host="0.0.0.0", token=bad)
+    assert "ASCII" in str(e.value), why
+    assert bad not in str(e.value)      # 别把密钥写进启动日志
+
+
+def test_token_length_counted_in_bytes():
+    """长度按字节算，和 Go 那侧的 len() 对齐。
+
+    按字符算的话，一个 20 字符 / 40 字节的 token 会出现"Go 放行、Python
+    拒绝启动"这种两边打架的局面 —— 同一个配置，两侧对它是否合法的判断相反。
+    """
+    from mini_agent.grpcserver import server as srv
+
+    # 31 字节：差一个，两侧都该拒。
+    with pytest.raises(SystemExit) as e:
+        srv._check_token("a" * 31)
+    assert "至少" in str(e.value)
+
+    srv._check_token("a" * 32)          # 正好 32：不抛就是通过
+
+
+def test_interceptor_survives_non_ascii_token():
+    """拦截器单独拿出来用也不能抛异常。
+
+    hmac.compare_digest 对含非 ASCII 的 str 直接抛 TypeError。serve() 已经在
+    启动时挡掉了这种密钥，但这个类是个安全组件 —— 它最坏的失败形态应该是
+    "拒绝放行"，不该是"抛异常"。所以内部一律按 bytes 比。
+    """
+    from mini_agent.grpcserver.server import _TokenAuthInterceptor
+
+    interceptor = _TokenAuthInterceptor("密钥" * 20)
+
+    class _Details:
+        method = "/agent.v1.AgentService/Health"
+        invocation_metadata = ((_AUTH_METADATA_KEY, "密钥" * 20),)
+
+    # 不关心它返不返回 deny，只要求"不抛"。
+    interceptor.intercept_service(lambda d: "PASSED", _Details())

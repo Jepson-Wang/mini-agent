@@ -28,6 +28,8 @@
 """
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import itertools
 import json
 import queue
@@ -76,6 +78,35 @@ _JOIN_TIMEOUT = 10.0
 _SESSION_WAIT_TIMEOUT = 300.0
 # 优雅关闭时留给在途请求的时间。
 _GRACE_PERIOD = 15.0
+
+# 共享密钥放在哪个 metadata 键里。gRPC 会把 key 统一小写，这里就按小写写死，
+# 免得两侧一个写 X-Agent-Token 一个写 x-agent-token 而对不上。
+# 对应 Go 那侧 agentclient 的 agentTokenMetadataKey。
+_AUTH_METADATA_KEY = "x-agent-token"
+
+# 密钥最短长度，和 Go 那侧 config.minSecretLen 取同一个数。
+# "填了个 8 位的" 比 "没填" 更危险：前者会让人以为已经防住了。
+#
+# ★ 按**字节**算，不按字符。Go 那侧 len() 数的是字节，这边 len() 数的是字符，
+#   不统一的话同一个 token 会出现"Go 放行、Python 拒绝启动"这种两边打架的局面
+#   （一个 20 字符 / 40 字节的 token 就能触发）。下面的 ASCII 限制让两者恒等，
+#   这里仍然显式 encode 一次，把这件事写在代码里而不是靠推理。
+_MIN_TOKEN_LEN = 32
+
+# 密钥允许的字节范围：0x21..0x7E，即可见 ASCII，不含空格。
+#
+# 不是洁癖。这个值要放进 gRPC metadata 的 x-agent-token，而 metadata 的
+# 非二进制键只接受 ASCII —— 塞个中文进去，配置校验放行、服务正常启动，
+# 然后每一次调用都在传输层被打回来：
+#
+#   Metadata value for key x-agent-token is invalid: Illegal header value
+#   → 客户端拿到 INTERNAL / "Invalid metadata"
+#
+# 日志里没有任何东西指向密钥格式，全靠猜。不含空格是因为空格在头部里合法，
+# 但会被两端的修剪逻辑吃掉，是另一个同样难查的坑。
+# 和 Go 那侧 config.checkWireSecret 是同一条规则，改一边必须改另一边。
+_TOKEN_MIN_BYTE = 0x21
+_TOKEN_MAX_BYTE = 0x7E
 
 # payload 上限。gRPC 这条路没有 HTTP binding tag 挡着，不截的话一次 read_file
 # 就能把几 MB 推给对面（而且会跟着任务详情回显给用户）。
@@ -259,6 +290,97 @@ class _SessionLocks:
             self._drop(session_id)
 
 
+class _TokenAuthInterceptor(grpc.ServerInterceptor):
+    """服务间鉴权：没带对 x-agent-token 的调用一律 UNAUTHENTICATED。
+
+    这个 surface 的权限比 Go 那侧的 /internal 还大 —— 能跑任意任务（attacker
+    自选 session_id）、读写工作区、无上限地烧 LLM 额度。而 /internal 尚且要
+    校验共享密钥（middleware.InternalAuth），这边一层都没有是说不通的。
+
+    实现上有两个点值得说明：
+
+      * 用 hmac.compare_digest 而不是 ==。后者会在第一个不同的字节上提前返回，
+        逐字节计时就能把密钥一位一位问出来。理由和 Go 那侧的
+        subtle.ConstantTimeCompare 完全一样。
+      * 拒绝时返回的是一个 unary_unary handler，哪怕被拦的是服务端流式方法。
+        这是 grpc-python 官方示例的写法，成立的原因是这个 handler 只调
+        context.abort()，它直接抛异常，根本走不到"按方法类型返回响应"那一步。
+
+    不给 Health 开后门：一个不用鉴权的探针会把版本号白送出去，
+    而版本号正是挑 exploit 时最想要的第一条信息。
+    """
+
+    def __init__(self, token: str):
+        # 存成 bytes:hmac.compare_digest 对含非 ASCII 的 str 直接抛 TypeError
+        # （"comparing strings with non-ASCII characters is not supported"）。
+        # serve() 已经在启动时把非 ASCII 的密钥挡掉了，这里再退一步用 bytes 比，
+        # 是为了让这个类**单独拿出来用也不会炸** —— 它是个安全组件，
+        # 最坏的失败形态不该是"抛异常"。
+        self._token = token.encode("utf-8")
+        self._deny = grpc.unary_unary_rpc_method_handler(self._abort)
+
+    @staticmethod
+    def _abort(request, context):
+        # 不区分"没带"和"带错了",也绝不把收到的值记进日志 ——
+        # 那等于把别人手抖贴错的真密钥写进日志系统。
+        context.abort(grpc.StatusCode.UNAUTHENTICATED, "凭证无效")
+
+    def intercept_service(self, continuation, handler_call_details):
+        md = dict(handler_call_details.invocation_metadata or ())
+        got = md.get(_AUTH_METADATA_KEY, "")
+        if isinstance(got, str):
+            got = got.encode("utf-8", errors="replace")
+        if hmac.compare_digest(got, self._token):
+            return continuation(handler_call_details)
+        logger.warning("gRPC 鉴权失败 method=%s", handler_call_details.method)
+        return self._deny
+
+
+def _is_loopback(host: str) -> bool:
+    """host 是不是只有本机能连上。
+
+    解析成 IP 再问 is_loopback，而不是拿字符串比 "127.0.0.1" ——
+    127.0.0.2、::ffff:127.0.0.1 这些同样只对本机可达，硬编码会漏。
+    解析不出来的（真域名、通配的 "" 和 "[::]"）一律按"对外可达"处理：
+    这里判错的代价是不对称的，宁可多要一次密钥。
+    """
+    if host in ("localhost",):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _check_token(token: str) -> None:
+    """校验共享密钥的长度和字符集。不合格就拒绝启动。
+
+    错误信息里绝不出现密钥本身、也不出现它的任何一段 —— 这条会进启动日志，
+    而启动日志通常是收集上去的。位置信息（第几个字节）足够定位问题了。
+    """
+    raw = token.encode("utf-8")
+    if len(raw) < _MIN_TOKEN_LEN:
+        raise SystemExit(
+            f"MINI_AGENT_GRPC_TOKEN 至少 {_MIN_TOKEN_LEN} 字节，当前 {len(raw)} 字节。"
+        )
+    for i, b in enumerate(raw, start=1):
+        if b < _TOKEN_MIN_BYTE or b > _TOKEN_MAX_BYTE:
+            raise SystemExit(
+                f"MINI_AGENT_GRPC_TOKEN 第 {i} 个字节不是可见 ASCII 字符。"
+                f"它要放进 gRPC metadata，非 ASCII 会让"
+                f"每一次调用都在传输层被拒"
+                f"（Illegal header value），而启动时看不出任何异常。"
+                f"用 openssl rand -base64 48 生成。"
+            )
+
+
+def _bind_target(host: str, port: int) -> str:
+    """拼 add_insecure_port 要的地址。IPv6 字面量得套方括号，否则冒号会被当分隔符。"""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
+
+
 class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
     """AgentService 的实现。一个实例服务所有请求，内部无 per-session 状态。"""
 
@@ -270,8 +392,28 @@ class AgentServicer(agent_pb2_grpc.AgentServiceServicer):
     # ---------- Health ----------
 
     def Health(self, request, context):
-        logger.debug("Health trace=%s", _trace_id(context))
-        return agent_pb2.HealthResponse(ok=True, version=VERSION)
+        """自检。ok 反映的是"我还能干活吗"，不是"这个进程还在吗"。
+
+        硬编码 ok=True 是错的：进程还在但库打不开（磁盘满、文件被删、权限变了）
+        时，每个任务都会在落库那步失败，而探针一路绿灯。Go 那侧专门为这件事
+        区分了两种结果 —— 拿不到回应叫"问不到"，拿到 ok=False 叫"问到了，
+        它说自己不好"（见 agentclient.Client.Health 的注释）。后者永远产生不了
+        的话，那个区分就是摆设，/health 的 agent 字段实际只有两态。
+
+        这里只探库不探 LLM：探 LLM 要发一次真请求，既花钱又慢，而 /health 是
+        被按秒轮询的。库是每个任务的必经之路，探它性价比最高。
+        """
+        ok = True
+        try:
+            self._agent.db.ping()
+        except PersistenceError as e:
+            # 不把原始错误回给对面：它会进 Go 的 /health 响应，而那条路径
+            # 是对外的（TestHealth_ProbeErrorNotEchoed 盯的就是这件事）。
+            # 详情只留在本地日志里。
+            logger.error("Health 自检失败：数据库不可用 %s", e)
+            ok = False
+        logger.debug("Health ok=%s trace=%s", ok, _trace_id(context))
+        return agent_pb2.HealthResponse(ok=ok, version=VERSION)
 
     # ---------- RunTask ----------
 
@@ -526,10 +668,32 @@ def _drain(q: queue.Queue, task_uid: str, seq) -> Iterator[agent_pb2.TaskEvent]:
 # ---------- 启动 ----------
 
 
-def serve(port: Optional[int] = None, max_workers: Optional[int] = None) -> None:
+def serve(
+    port: Optional[int] = None,
+    max_workers: Optional[int] = None,
+    host: Optional[str] = None,
+    token: Optional[str] = None,
+) -> None:
     """起 gRPC server 并阻塞，直到收到 SIGINT / SIGTERM。"""
     port = settings.grpc_port if port is None else port
     max_workers = settings.grpc_max_workers if max_workers is None else max_workers
+    host = settings.grpc_host if host is None else host
+    token = settings.grpc_token if token is None else token
+
+    # 密钥策略：绑回环可以不配（本机开发），一旦往外绑就必须配。
+    #
+    # 取向和 Go 那侧的 AGENT_CALLBACK_SECRET 一致 —— 宁可拒绝启动，也不要
+    # "能跑但没防护"。区别只在于这边是启动期就拒：/internal 漏配时受影响的
+    # 是一组接口，而这里漏配时受影响的是整个进程的全部能力。
+    if not token and not _is_loopback(host):
+        raise SystemExit(
+            f"监听地址 {host} 不是回环，但没有配 MINI_AGENT_GRPC_TOKEN。\n"
+            "这个端口能跑任意任务、读写工作区、消耗 LLM 额度，不能裸奔。\n"
+            "要么设 MINI_AGENT_GRPC_TOKEN（Go 那侧对应 AGENT_GRPC_TOKEN，两边必须一致），\n"
+            "要么把 MINI_AGENT_GRPC_HOST 设回 127.0.0.1。"
+        )
+    if token:
+        _check_token(token)
 
     if not settings.deepseek_api_key:
         # 和 CLI 同样的前置检查。没有 key 也能把端口听起来，但每个任务都会在
@@ -549,19 +713,28 @@ def serve(port: Optional[int] = None, max_workers: Optional[int] = None) -> None
     agent = Agent(db=db, toolset=DEFAULT_TOOLSET, max_turns=settings.max_turns)
     servicer = AgentServicer(agent)
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=max_workers))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=max_workers),
+        interceptors=[_TokenAuthInterceptor(token)] if token else [],
+    )
     agent_pb2_grpc.add_AgentServiceServicer_to_server(servicer, server)
 
     # add_insecure_port 返回 0 表示端口没绑上（被占用 / 无权限）。不检查的话
     # 服务会"正常启动"然后谁也连不上。
-    if server.add_insecure_port(f"[::]:{port}") == 0:
-        raise SystemExit(f"端口 {port} 绑定失败（被占用或无权限）")
+    if server.add_insecure_port(_bind_target(host, port)) == 0:
+        raise SystemExit(f"{host}:{port} 绑定失败（被占用或无权限）")
 
     server.start()
+    # 只说鉴权开没开，不打密钥、也不打它的长度或指纹。
     logger.info(
-        "gRPC server 已启动 port=%d workers=%d model=%s version=%s",
-        port, max_workers, settings.model, VERSION,
+        "gRPC server 已启动 host=%s port=%d workers=%d auth=%s model=%s version=%s",
+        host, port, max_workers, "on" if token else "off", settings.model, VERSION,
     )
+    if not token:
+        logger.warning(
+            "未配置 MINI_AGENT_GRPC_TOKEN，本服务不做鉴权 —— "
+            "只因为绑的是回环地址 %s 才允许这样跑。", host,
+        )
 
     stop = threading.Event()
 

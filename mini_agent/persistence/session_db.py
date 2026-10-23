@@ -37,10 +37,27 @@ class MiniSessionDB:
 
     def __init__(self, path: str):
         # isolation_level=None → 关掉 Python 的隐式事务管理(见下方"坑")
-        # check_same_thread=False → M1 的并行只读工具、M4 的子代理都会跨线程用同一个 db。
-        #   但光开这个不够:两个线程同时 BEGIN IMMEDIATE 会撞
+        # check_same_thread=False → M1 的并行只读工具、M4 的子代理、gRPC surface
+        #   都会跨线程用同一个 db。
+        #
+        #   ★ 但这个参数只是**关掉检查**,它不会让 Connection 变成线程安全的。
+        #   底层 sqlite 是 serialized 模式没错,可 Python 的 sqlite3.Connection
+        #   自己带一个语句缓存,而 conn.execute() 是"建游标 + 用缓存"的快捷方式 ——
+        #   多个线程同时调它就是在并发改同一份缓存。实测(四个线程各 300 轮读写)
+        #   会随机踩到:
+        #     - sqlite3.InterfaceError: bad parameter or other API misuse
+        #     - IndexError: tuple index out of range(抛在 sqlite3 模块内部)
+        #     - **读回来的行内容是错的**:recover() 拿到 content=None 或空串
+        #   最后一条最危险:recover() 的既定策略是"坏行跳过 + 记日志,绝不抛",
+        #   所以这个竞态的表现是**一条消息从 transcript 里静悄悄消失**,没有任何
+        #   人报错。这正是 _SessionLocks 拼命要防的那种损坏,只不过来自更下面一层。
+        #
+        #   另外两个线程同时 BEGIN IMMEDIATE 还会撞
         #   "cannot start a transaction within a transaction"(那是连接级状态,
-        #   不是数据库级锁)。所以写事务再用一把 RLock 串行化,见 _write_txn。
+        #   不是数据库级锁)。
+        #
+        #   所以:**所有**碰 self.conn 的地方都必须先拿 _conn_lock,读也一样。
+        #   见 _read / _write_txn。
         # 整个构造过程都要收进 _db_guard:它是持久化层的边界,边界上只能抛
         # PersistenceError。漏一个裸 sqlite3 异常出去,调用方那句
         # `except PersistenceError` 就白写了 —— __main__ 里那条"数据还在、可以开
@@ -50,7 +67,7 @@ class MiniSessionDB:
                 path, isolation_level=None, check_same_thread=False
             )
             self.conn.row_factory = sqlite3.Row
-            self._txn_lock = threading.RLock()
+            self._conn_lock = threading.RLock()
             self._configure()
         self._create_tables()
 
@@ -105,14 +122,29 @@ class MiniSessionDB:
             ) from e
 
     @contextmanager
+    def _read(self):
+        """一次读。**拿的是和写同一把锁**。
+
+        读也要串行,理由见 __init__ 里那段:并发调 conn.execute() 会踩到
+        Connection 的语句缓存竞态,轻则 InterfaceError,重则读回错误的行内容
+        而没有任何人报错。这里没有"读不需要加锁"的余地。
+
+        代价是一个进程内的读被串行化了。可以接受:sqlite3 在 step 期间会放开
+        GIL,而且这个库的量级本来就不靠单进程并发读撑吞吐。真需要并发读的话,
+        正确做法是每个线程一条连接(WAL 下读者不会被写者阻塞),不是把锁去掉。
+        """
+        with self._conn_lock:
+            yield self.conn
+
+    @contextmanager
     def _write_txn(self):
         """一次原子写。BEGIN IMMEDIATE 立即拿写锁,失败即回滚。
 
         RLock:同一连接上不能并发开事务(见 __init__ 注释)。用 R 版而不是普通
         Lock,是为了让"不小心嵌套 _write_txn"暴露成 sqlite 的显式报错,
-        而不是变成一个静默死锁。
+        而不是变成一个静默死锁。R 版同时也让 _read 能安全地嵌在写事务里。
         """
-        with self._txn_lock:
+        with self._conn_lock:
             c = self.conn
             c.execute("BEGIN IMMEDIATE;")  # 立即申请写锁,不拖到第一条写语句
             try:
@@ -121,6 +153,20 @@ class MiniSessionDB:
             except Exception:
                 c.execute("ROLLBACK;")
                 raise
+
+    def ping(self) -> None:
+        """自检：库还能读吗。读得到就正常返回，读不到抛 PersistenceError。
+
+        给 gRPC 的 Health 用。查的是 sessions 表而不是 `SELECT 1`：后者只证明
+        sqlite 这个库还在，连文件被删掉都发现不了（连接句柄还握着已删除的
+        inode，照样返回 1）。读一张真表才会碰到页缓存之外的东西。
+
+        LIMIT 0 是刻意的：只要求 sqlite 解析 + 打开表，不真取行，
+        所以库多大都是常数开销 —— 这条路径会被探针按秒轮询。
+        """
+        with self._db_guard("数据库自检", hint="(文件被删 / 权限变了 / 磁盘故障)"):
+            with self._read() as c:
+                c.execute("SELECT session_id FROM sessions LIMIT 0;").fetchall()
 
     def _create_tables(self):
         """建表。★ 先读后写:表已就绪时直接返回,不碰写锁。
@@ -135,11 +181,12 @@ class MiniSessionDB:
         """
         with self._db_guard("_create_tables"):
             placeholders = ",".join("?" * len(_TABLES))
-            n = self.conn.execute(
-                f"SELECT COUNT(*) FROM sqlite_master "
-                f"WHERE type='table' AND name IN ({placeholders});",
-                _TABLES,
-            ).fetchone()[0]
+            with self._read() as c:
+                n = c.execute(
+                    f"SELECT COUNT(*) FROM sqlite_master "
+                    f"WHERE type='table' AND name IN ({placeholders});",
+                    _TABLES,
+                ).fetchone()[0]
             if n == len(_TABLES):
                 return
 
@@ -177,9 +224,10 @@ class MiniSessionDB:
         用户 --resume sess_xxx 时先校验，不存在就早报错
         """
         with self._db_guard(f"session_exists(session={session_id})"):
-            row = self.conn.execute(
-                "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1;", (session_id,)
-            ).fetchone()
+            with self._read() as c:
+                row = c.execute(
+                    "SELECT 1 FROM sessions WHERE session_id = ? LIMIT 1;", (session_id,)
+                ).fetchone()
         return row is not None
 
     def ensure_session(
@@ -395,10 +443,11 @@ class MiniSessionDB:
         PRAGMA busy_timeout 在 SQLite 层兜住,不必在应用层再套一层。
         """
         with self._db_guard(f"recover(session={session_id})"):
-            rows = self.conn.execute(
-                "SELECT seq, content FROM messages WHERE session_id = ? ORDER BY seq;",
-                (session_id,),
-            ).fetchall()
+            with self._read() as c:
+                rows = c.execute(
+                    "SELECT seq, content FROM messages WHERE session_id = ? ORDER BY seq;",
+                    (session_id,),
+                ).fetchall()
 
         messages: list[Message] = []
         for row in rows:
@@ -432,9 +481,10 @@ class MiniSessionDB:
             raise PersistenceError("get_executed_result: key 不能为空")
 
         with self._db_guard(f"get_executed_result(key={key})"):
-            row = self.conn.execute(
-                "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
-            ).fetchone()
+            with self._read() as c:
+                row = c.execute(
+                    "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
+                ).fetchone()
             if row is None:
                 return None
             raw = row["result"]

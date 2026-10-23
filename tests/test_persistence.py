@@ -627,3 +627,97 @@ def test_chinese_result_stored_unescaped(db):
     assert "中文" in stored
     assert "\\u4e2d" not in stored
     assert json.loads(stored) == {"text": "中文"}
+
+
+# --------------------------------------------------------------------------
+# ping：给 gRPC 的 Health 用的自检
+# --------------------------------------------------------------------------
+
+def test_ping_ok_on_healthy_db(db):
+    db.ping()          # 不抛就是通过
+
+
+def test_ping_raises_persistence_error_when_db_is_gone(db_path):
+    """库用不了时必须抛 PersistenceError，不是裸的 sqlite 异常。
+
+    调用方是 grpcserver 的 Health，它只 except PersistenceError —— 漏一个裸
+    sqlite3.Error 出去，那条 except 就白写了，Health 会直接把异常抛回 gRPC，
+    对面看到的是 UNKNOWN 而不是"问到了，它说自己不好"。
+
+    这里自己建一个 db 而不是用 db fixture：下面要 close 掉连接，而一个被关掉
+    的连接留在共享 fixture 上会污染后面的用例（见 test_grpcserver 的 _break_db）。
+    """
+    broken = MiniSessionDB(db_path)
+    broken.conn.close()
+
+    with pytest.raises(PersistenceError):
+        broken.ping()
+
+
+def test_ping_is_read_only(db):
+    """自检不该改库。它会被探针按秒轮询，顺手写一笔的话噪音会很可观。"""
+    sid = db.create_session()
+    before = db.recover(sid)
+    db.ping()
+    assert db.recover(sid) == before
+    assert db.session_exists(sid)
+
+
+# --------------------------------------------------------------------------
+# 线程安全：check_same_thread=False 只是关掉检查，不等于连接可以并发用
+# --------------------------------------------------------------------------
+
+def test_concurrent_read_write_does_not_corrupt(db):
+    """多线程同时读写同一个 db，不能报错，也不能读出坏行。
+
+    这条护的是一个真实 bug：读路径（session_exists / recover /
+    get_executed_result）过去直接调 self.conn.execute，没拿锁。sqlite 本身是
+    serialized 模式，但 Python 的 Connection 带一个共享的语句缓存，conn.execute()
+    是"建游标 + 用缓存"的快捷方式 —— 并发调它就是在并发改那份缓存。实测会随机
+    抛 InterfaceError('bad parameter or other API misuse')、抛 sqlite3 模块内部的
+    IndexError，**并且读回内容为 None / 空串的行**。
+
+    最后那个才是真正危险的：recover() 对坏行的既定策略是"跳过 + 记日志，绝不抛"，
+    所以这个竞态的表现是一条消息从 transcript 里静悄悄消失，没有任何人报错。
+    CLI 单线程时碰不到，是 gRPC surface 让它变得可达。
+
+    断言里检查条数而不只是"没抛异常"：只看异常的话，静默丢消息这个最坏的
+    分支恰好检不出来。
+    """
+    import sys
+    import threading
+
+    # 把线程切换间隔调到最小,好让竞态**稳定**复现。不调的话默认 5ms 一次切换,
+    # 四个线程常常各自跑完一整段才被换下去,窗口撞不上 —— 实测漏检率约三分之一,
+    # 那样这条用例就成了"有时候能发现问题"的摆设。
+    # 这是进程级设置,必须还回去(用 try/finally,断言失败时也要还)。
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    sids = [db.create_session() for _ in range(6)]
+    rounds = 80
+    errors: list[str] = []
+
+    def worker(sid: str) -> None:
+        try:
+            for i in range(rounds):
+                db.session_exists(sid)
+                db.append_message(sid, Message(role="user", content=f"{sid}-{i}"))
+                db.recover(sid)
+        except Exception as e:                      # noqa: BLE001 —— 要的就是"任何异常"
+            errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=worker, args=(s,)) for s in sids]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    assert errors == []
+    for sid in sids:
+        msgs = db.recover(sid)
+        assert len(msgs) == rounds, f"{sid} 少了消息：{len(msgs)} != {rounds}"
+        assert [m.content for m in msgs] == [f"{sid}-{i}" for i in range(rounds)]

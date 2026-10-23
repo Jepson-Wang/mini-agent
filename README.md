@@ -34,6 +34,18 @@ pytest -m slow          # 只跑真 SIGKILL 的崩溃恢复
 测试不需要 API key 和网络：`tests/conftest.py` 的 `fake_llm` fixture 会把
 `mini_agent.agent.call_llm` 换成脚本化的假响应。
 
+干净 clone 上要先跑一次下面「protoc」一节的生成命令，否则 `test_grpcserver.py`
+在收集阶段就 ImportError。
+
+### CI
+
+`.github/workflows/ci.yml` 跑的就是上面这几条命令，没有 CI 专属的魔法：
+`pip install -e ".[dev]"` → protoc 生成 → `pytest -m "not slow"` → `pytest -m slow`，
+在 ubuntu/3.11、ubuntu/3.15、windows/3.14 三个组合上各跑一遍。本地能复现 CI 的一切。
+
+CI **不检查** `mini_agent/proto/` 和 backend 那份权威副本是否一致（它只 clone 本仓库）。
+两份是否逐字节相同，目前只能靠改协议时照下面的顺序手工保证。
+
 ## protoc：改了 .proto 之后
 
 `.proto` 的**权威副本在 backend 仓库**（`backend/proto/agent/v1/agent.proto`），

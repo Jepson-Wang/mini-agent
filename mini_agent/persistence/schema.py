@@ -6,6 +6,12 @@ content 直接存整条 Message 序列化后的 JSON。
 """
 from __future__ import annotations
 
+# 写进 PRAGMA user_version 的 schema 版本号，_create_tables 据此决定要不要迁移。
+# 改动任何一张表的结构都要 +1，并在 _create_tables 的慢路径里补对应的迁移步骤。
+#   0：旧库（executed_keys 以模型给的 tool_call.id 为主键）
+#   1：executed_keys 改为 (session_id, assistant_seq, tool_index) 复合主键
+SCHEMA_VERSION = 1
+
 SESSION_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id         TEXT    PRIMARY KEY,
@@ -32,11 +38,19 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 """
 
+# 幂等键完全由我们自己的数据构成，主键里没有任何模型输入：
+#   旧版主键是模型给的 tool_call.id —— 跨会话撞 id 会串结果（隐私泄露），同会话
+#   跨轮复用 id 会让后一轮的写入被 ON CONFLICT 吞掉。
+# 外键让数据库保证每条记录都指向一条真实存在的 assistant 消息。
 EXECUTED_KEYS_CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS executed_keys (
-    idempotency_key TEXT PRIMARY KEY,   -- 唯一标识"某一次工具调用"
-    session_id      TEXT NOT NULL,
-    result          TEXT NOT NULL,      -- 这次调用产生的结果(JSON)
-    created_at      INTEGER NOT NULL
+    session_id     TEXT    NOT NULL,
+    assistant_seq  INTEGER NOT NULL,   -- 发起这批 tool_calls 的 assistant 消息在 messages 里的 seq
+    tool_index     INTEGER NOT NULL,   -- 该 tool_call 在 assistant.tool_calls 里的下标
+    tool_call_id   TEXT    NOT NULL,   -- 模型给的 id：不参与主键，只用于读侧校验 + 排查
+    result         TEXT    NOT NULL,   -- 这次调用产生的结果(JSON)
+    created_at     INTEGER NOT NULL,
+    PRIMARY KEY (session_id, assistant_seq, tool_index),
+    FOREIGN KEY (session_id, assistant_seq) REFERENCES messages(session_id, seq)
 );
 """

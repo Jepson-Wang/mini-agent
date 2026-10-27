@@ -3,12 +3,14 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import defaultdict, deque
 from contextlib import contextmanager
 
 from pydantic import ValidationError
 
 from mini_agent.log import get_logger
 from mini_agent.persistence.schema import (
+    SCHEMA_VERSION,
     SESSION_CREATE_SQL,
     MESSAGES_CREATE_SQL,
     EXECUTED_KEYS_CREATE_SQL,
@@ -26,6 +28,9 @@ _VALID_ROLES = {"system", "user", "assistant", "tool"}
 
 # _create_tables 用它判断"表是否已就绪"，从而跳过写锁。改动建表语句时要同步改这里。
 _TABLES = ("sessions", "messages", "executed_keys")
+
+# 旧版 executed_keys 迁移时改名到这里。只改名不 DROP：自动迁移不该做不可逆的事。
+_LEGACY_EXECUTED_KEYS = "executed_keys_legacy_v0"
 
 # 崩在"tool 结果没落库"的瞬间、且幂等表里也没有真结果时,用它补桩。
 _INTERRUPTED = json.dumps(
@@ -176,24 +181,93 @@ class MiniSessionDB:
         busy_timeout(实测 5.5s)甚至失败。而 WAL 下读者本该永不被写者阻塞,这等于
         把 WAL 的好处在门口就丢掉了。M4 多进程共享 db 时这会变成常态。
 
-        竞态安全:两个进程可能都看到表不全、都去建,但 CREATE TABLE IF NOT EXISTS
-        幂等,且在 BEGIN IMMEDIATE 里串行,最多白跑一次。
+        ★ 兼做 schema 迁移,版本号存在 PRAGMA user_version 里(见 schema.SCHEMA_VERSION)。
+          SQLite 改不了已有表的主键,executed_keys 换主键只能重建表,所以必须有
+          版本号来区分"新库 / 旧库 / 已迁移的库"。
+
+        快路径(只拿读锁):版本对、三张表齐 → 直接返回。版本比代码认识的还新
+        (用新库跑旧代码)→ 抛 PersistenceError,不去猜那份结构该怎么用。
+
+        慢路径(BEGIN IMMEDIATE):**再查一次**版本(double-checked)。两个进程
+        可能同时在快路径上看到旧版本,但写锁让它们串行,后到的那个二次检查时
+        读到的已经是新版本,直接退出 —— 只迁一次。快路径不拿写锁也是安全的:
+        WAL 下别人的迁移没提交前,读到的始终是迁移前的完整结构;版本只增不减,
+        所以"读到旧版本"最多导致白进一次慢路径,不会导致用错结构。
+
+        原子性:ALTER TABLE、CREATE TABLE、PRAGMA user_version 都在同一个事务里,
+        user_version 写在库文件头里、随事务回滚。迁移中途失败 = 整段撤销,
+        库停在旧版本、旧表原名原样,下次打开再试。
         """
         with self._db_guard("_create_tables"):
-            placeholders = ",".join("?" * len(_TABLES))
             with self._read() as c:
-                n = c.execute(
-                    f"SELECT COUNT(*) FROM sqlite_master "
-                    f"WHERE type='table' AND name IN ({placeholders});",
-                    _TABLES,
-                ).fetchone()[0]
-            if n == len(_TABLES):
-                return
+                if self._schema_is_current(c):
+                    return
 
             with self._write_txn() as c:
+                if self._schema_is_current(c):   # double-checked:别人刚迁完
+                    return
+                self._retire_legacy_executed_keys(c)
                 c.execute(SESSION_CREATE_SQL)
                 c.execute(MESSAGES_CREATE_SQL)
                 c.execute(EXECUTED_KEYS_CREATE_SQL)
+                # ★ PRAGMA 不接受 ? 占位符,只能把整数常量拼进 SQL。
+                #   SCHEMA_VERSION 是代码里的 int 常量,不是外部输入,没有注入面。
+                c.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
+
+    @staticmethod
+    def _schema_is_current(c: sqlite3.Connection) -> bool:
+        """版本 == SCHEMA_VERSION 且三张表齐全。版本更新则直接拒绝。
+
+        版本对了还要数表,是因为"版本 1 但缺表"也可能出现(有人手工删了表),
+        那种情况让慢路径用 IF NOT EXISTS 补齐即可。
+        """
+        version = c.execute("PRAGMA user_version;").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise PersistenceError(
+                f"数据库 schema 版本是 {version},比当前代码认识的 {SCHEMA_VERSION} 更新 "
+                f"—— 它是被更新版本的 mini_agent 写过的。请升级代码后再打开,"
+                f"不要用旧代码读写它(旧代码不认识新结构,会写坏数据)。"
+            )
+        if version < SCHEMA_VERSION:
+            return False
+        placeholders = ",".join("?" * len(_TABLES))
+        n = c.execute(
+            f"SELECT COUNT(*) FROM sqlite_master "
+            f"WHERE type='table' AND name IN ({placeholders});",
+            _TABLES,
+        ).fetchone()[0]
+        return n == len(_TABLES)
+
+    @staticmethod
+    def _retire_legacy_executed_keys(c: sqlite3.Connection) -> None:
+        """v0 → v1:旧的 executed_keys(以模型给的 tool_call.id 为主键)改名封存。
+
+        必须在 _write_txn 里调用。判断旧库看的是**有没有 idempotency_key 列**,
+        而不是"表存在":新表也叫 executed_keys,只看名字会把刚建好的新表也改名。
+
+        旧数据不迁、不删、以后也不再读:
+          - 旧行无法可靠地映射到 (assistant_seq, tool_index) —— 用 id 反查本身
+            就是这次要修的 bug;
+          - 它唯一的用处是"升级前恰好崩在记表与写 tool 消息之间"的会话,丢了也只
+            是降级成 interrupted 桩,符合 recover 的金规则。
+        改名而不是 DROP:自动迁移不该做不可逆的事,真要排查时数据还在。
+        RENAME 会把旧表的自动索引一起改名,不会和新表的主键索引撞名;没有别的
+        表引用 executed_keys,外键也不受影响。
+        """
+        cols = {r["name"] for r in c.execute("PRAGMA table_info(executed_keys);")}
+        if "idempotency_key" not in cols:
+            return   # 没有这张表(新库),或者已经是新结构
+
+        target = _LEGACY_EXECUTED_KEYS
+        taken = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = ?;", (target,)
+        ).fetchone()
+        if taken is not None:
+            # 名字被占了(比如上次手工迁过一半)。别去动占位的那张表,换个名字。
+            target = f"{_LEGACY_EXECUTED_KEYS}_{int(time.time())}"
+        logger.info("schema 迁移 v0→v%d: 旧 executed_keys 改名为 %s", SCHEMA_VERSION, target)
+        # 表名同样不能用 ? 传,这里拼的是常量 + 整数时间戳,不是外部输入
+        c.execute(f'ALTER TABLE executed_keys RENAME TO "{target}";')
 
     # ---------- session 生命周期 ----------
 
@@ -330,91 +404,138 @@ class MiniSessionDB:
 
     # ---------- 崩溃恢复 ----------
 
-    def _sanitize_dangling_tool_calls(self, messages: list[Message]) -> list[Message]:
+    def _sanitize_dangling_tool_calls(
+        self, session_id: str, rows: list[tuple[int, str, Message | None]]
+    ) -> list[Message]:
         """把每一轮 assistant(tool_calls) 补足成配对完整、可安全发给 DeepSeek 的形状。
+
+        输入是 recover 读出来的 (seq, role 列, 解析后的 Message 或 None) 三元组,
+        None 表示那一行 JSON 坏了、已被跳过。
 
         ★ 补桩,不是丢弃。 残缺的那一轮**绝不能删**:删掉 = 抹掉「这个工具可能
         已经跑过」这个事实,模型看不见就会重做一遍(邮件重发、文件重写)。正确解法
         是给每个没有结果的 tool_call 补一条 role="tool" 消息 —— 配对补齐(不 400),
         同时如实告诉模型「这次调用结果未知」,让它自己决定要不要重试。
-        补桩前先查幂等表:命中说明崩在「已 record_executed_key、还没 append_message」
-        之间,能拿回真结果,一次都不用重跑。
+        补桩前先按 (session_id, assistant_seq, tool_index) 查幂等表:命中说明崩在
+        「已 record_executed_key、还没 append_message」之间,能拿回真结果,一次都
+        不用重跑。
 
         ★ 补桩 != 重跑。 本方法执行零个 handler、零次 LLM 调用,纯读 + 纯计算。
         恢复过程一旦有副作用,你就得为恢复写恢复,那是个无底洞。
 
-        不变量:在【串行】主循环里,_execute_tool_calls 会把一轮的 N 个 tool 结果
-        全部落库后才回到循环顶去取下一个 assistant。所以残缺的轮次后面不可能再挂
-        消息 —— 悬空【至多一个,且必然在尾部】。这里仍然遍历全部消息而不是只看
-        尾巴,是防御性的:M4 子代理 / M6 并行工具会打破这个串行前提,到那时只处理
-        尾部就会漏。顺带,按 tool_calls 的顺序重排结果,乱序也能被修正。
-        """
-        # 第一遍:把所有 tool result 按 tool_call_id 建索引(不管它在哪个位置)
-        results_by_id = {}
-        for msg in messages:
-            if msg.role == "tool":
-                results_by_id[msg.tool_call_id] = msg
+        ★ 按窗口配对,不按全会话的 id 配对。 一条 assistant(tool_calls) 的结果,
+        只从**紧跟它的那段 tool 行**里认领;窗口遇到下一条 role 不是 tool 的行就截断。
+          - 旧实现给整个会话建 {tool_call_id: msg} 索引:模型只要在两轮里复用同一个
+            id,后写的就覆盖先写的,第 1 轮的 assistant 认领第 3 轮的结果。无状态化
+            之后每轮开头都要 recover,所以这是**正常路径**上的错配,不需要崩溃。
+            结果能不能取对,不能取决于模型给的 id 是否唯一 —— 那是外部输入。
+          - 截断看的是 **role 列**,不是解析成功的消息。坏掉被跳过的 assistant 行
+            照样截断窗口,它后面的 tool 行成为孤儿被丢弃,而不是并进上一条
+            assistant 的窗口、被错误地认领。
+          - 窗口内每个 id 一个**先进先出队列**,取走的不再复用。同一条 assistant 里
+            两个 tool_call 同 id 时,按 dict 匹配会让两个 tc 拿到同一条结果;串行下
+            tool 行的落库顺序就是 tool_calls 的下标顺序,所以先进先出等价于按位置配,
+            同时还能容忍不同 id 之间的乱序(顺带按 tool_calls 顺序重排)。
+          - 窗口里多出来的、认领不到的 tool 行,以及不在任何窗口里的孤儿,丢弃 + 告警。
 
-        # 第二遍:逐轮认领
-        kept = []
-        for msg in messages:
-            if msg.role == "tool":
-                continue  # tool 消息不单独保留,由所属轮次带出
+        不变量:【串行】主循环里,_execute_tool_calls 按 tool_calls 的下标顺序逐个
+        执行、逐个落库,所以窗口里 tool 行的顺序 == 下标顺序。残缺的窗口要么在尾部
+        (崩溃),要么后面紧跟一条封口 assistant(取消,见 agent._seal_cancelled_turn)
+        —— 两种情况桩都补在窗口末尾、下一条非 tool 行之前,配对仍然合法。
+        这里遍历全部行而不是只看尾巴,是防御性的。
+          ★ M6 并行工具会打破"执行顺序 == 下标顺序":到那时必须在 dispatch **之前**
+            就把 idx 绑定到每个 tool_call 上(record_executed_key 用的是它),并且
+            tool 消息仍然**按 idx 顺序**落库 —— 否则同 id 的先进先出就不再等价于
+            按位置配。
+        """
+        kept: list[Message] = []
+        i, n = 0, len(rows)
+        while i < n:
+            seq, role, msg = rows[i]
+            i += 1
+
+            if role == "tool":
+                # 能走到这里,说明它不在任何 assistant(tool_calls) 的窗口里
+                if msg is not None:
+                    logger.warning(
+                        "recover: 丢弃孤儿 tool 消息 session=%s seq=%s tool_call_id=%r",
+                        session_id, seq, msg.tool_call_id,
+                    )
+                continue
+
+            if msg is None:
+                continue  # 坏行,recover 已告警;它的 role 列照样截断了上一个窗口
 
             if msg.role != "assistant" or not msg.tool_calls:
                 kept.append(msg)  # system/user/纯文本 assistant,天然完整
                 continue
 
+            # 收集窗口:紧跟在后面、role 列为 tool 的那一段
+            queues: dict[str, deque[Message]] = defaultdict(deque)
+            while i < n and rows[i][1] == "tool":
+                if rows[i][2] is not None:
+                    queues[rows[i][2].tool_call_id].append(rows[i][2])
+                i += 1
+
             kept.append(msg)
-
-            for tc in msg.tool_calls:
-                r = results_by_id.get(tc.id)
-                if r is not None:
-                    kept.append(r)  # 真结果,原样带出(顺便按 tool_calls 顺序修复乱序)
+            for idx, tc in enumerate(msg.tool_calls):
+                q = queues.get(tc.id)
+                if q:
+                    kept.append(q.popleft())  # 真结果,原样带出
                     continue
-
-                # 结果没落库 → 先看幂等表里有没有 handler 真跑出来的结果。
-                # 命中说明崩在"已 record_executed_key、还没 append_message"之间,
-                # 这一步是无损恢复;未命中才是真丢了。
-                #
-                # ★ 空 id 必须自己挡掉,不能交给 get_executed_result。
-                #   那里的「key 不能为空」守卫是用来抓**调用方的编程错误**的,完全
-                #   正当;但 recover 传进去的不是程序算出来的值,而是**从库里读出来
-                #   的历史数据** —— ToolCall.id 允许空串,且 from_openai 在 SDK 漏
-                #   给 id 时默认就是 ""。同一个守卫在这里会把一次数据异常升级成
-                #   PersistenceError,让这个会话**永远 --resume 不了**。
-                #   recover 面对历史数据的铁律:任何"这不该发生"都降级,不抛。
-                if not tc.id:
-                    # 没 id 就无从查表,也无从配对,直接补桩收场。
-                    content = _INTERRUPTED
-                    logger.warning("recover: tool_call 缺 id,无法配对,补 interrupted 桩")
-                else:
-                    cached = self.get_executed_result(tc.id)
-                    content = cached.get("content") if isinstance(cached, dict) else None
-                    # ★ 必须是字符串才认。 Message.content 是 str|None,塞个 dict/int
-                    #   进去会抛 pydantic ValidationError —— 那不是 PersistenceError,
-                    #   _db_guard 拦不住(它只认 sqlite3/json 异常),__main__ 的
-                    #   except PersistenceError 也接不住,用户得到裸 traceback 且这个
-                    #   会话永久 --resume 不了。
-                    #   而 {"content": <str>} 只是 agent.py 和这里的口头约定:
-                    #   record_executed_key 的签名收任意 dict,没有任何东西强制形状。
-                    #   读侧必须自己扛住 —— 库里的东西是谁写的、什么时候写的,recover
-                    #   一概不知道,只能假设它可能是任何形状。
-                    if isinstance(content, str):
-                        logger.warning("recover: tc=%s 用幂等表里的真结果补回", tc.id)
-                    else:
-                        if content is not None:
-                            logger.warning(
-                                "recover: tc=%s 幂等表里的 content 是 %s 不是 str,"
-                                "按未命中处理", tc.id, type(content).__name__,
-                            )
-                        content = _INTERRUPTED
-                        logger.warning("recover: tc=%s 结果丢失,补 interrupted 桩", tc.id)
-
+                content = self._backfill_from_executed_keys(session_id, seq, idx, tc.id)
                 # 补出来的这条必须和真结果长得一模一样,否则照样 400
                 kept.append(Message(role="tool", tool_call_id=tc.id, content=content))
 
+            leftover = sum(len(q) for q in queues.values())
+            if leftover:
+                logger.warning(
+                    "recover: assistant seq=%s 的窗口里有 %d 条 tool 消息认领不到,丢弃 "
+                    "session=%s", seq, leftover, session_id,
+                )
+
         return kept
+
+    def _backfill_from_executed_keys(
+        self, session_id: str, assistant_seq: int, idx: int, tc_id: str
+    ) -> str:
+        """窗口里没有这个 tool_call 的结果 → 查幂等表;查不到就返回 interrupted 桩。
+
+        命中说明崩在"已 record_executed_key、还没 append_message"之间,这一步是
+        无损恢复;未命中才是真丢了。
+
+        ★ 空 tc.id 照常查。 键是 (session, assistant_seq, idx),里面不含模型给的 id,
+          空不空和"能不能查"无关;id 只参与读侧的一致性比对。旧实现对空 id 直接补桩,
+          是因为旧键就是 id 本身 —— 换了键之后再这么做,只会白白丢掉一个已经存下来的
+          真结果,害模型重跑一次有副作用的操作。
+        """
+        cached = self.get_executed_result(session_id, assistant_seq, idx, tc_id)
+        content = cached.get("content") if isinstance(cached, dict) else None
+        # ★ 必须是字符串才认。 Message.content 是 str|None,塞个 dict/int
+        #   进去会抛 pydantic ValidationError —— 那不是 PersistenceError,
+        #   _db_guard 拦不住(它只认 sqlite3/json 异常),__main__ 的
+        #   except PersistenceError 也接不住,用户得到裸 traceback 且这个
+        #   会话永久 --resume 不了。
+        #   而 {"content": <str>} 只是 agent.py 和这里的口头约定:
+        #   record_executed_key 的签名收任意 dict,没有任何东西强制形状。
+        #   读侧必须自己扛住 —— 库里的东西是谁写的、什么时候写的,recover
+        #   一概不知道,只能假设它可能是任何形状。
+        if isinstance(content, str):
+            logger.warning(
+                "recover: seq=%s idx=%s tc=%r 用幂等表里的真结果补回",
+                assistant_seq, idx, tc_id,
+            )
+            return content
+        if content is not None:
+            logger.warning(
+                "recover: seq=%s idx=%s tc=%r 幂等表里的 content 是 %s 不是 str,"
+                "按未命中处理", assistant_seq, idx, tc_id, type(content).__name__,
+            )
+        logger.warning(
+            "recover: seq=%s idx=%s tc=%r 结果丢失,补 interrupted 桩",
+            assistant_seq, idx, tc_id,
+        )
+        return _INTERRUPTED
 
     def recover(self, session_id: str) -> list[Message]:
         """
@@ -428,9 +549,10 @@ class MiniSessionDB:
           是任何形状。已经踩过四次同一个坑,每次症状都一样:一处"这不该发生"的
           检查被历史数据触发 → 抛异常 → 那个会话**永久** --resume 不了(坏数据
           在库里,重试一万次结果相同):
-            1. messages 行 JSON 坏 → 跳过该行 + 告警
-            2. executed_keys 行 JSON 坏 → 按未命中处理
-            3. tool_call 的 id 是空串 → 直接补桩,不去踩空 key 守卫
+            1. messages 行 JSON 坏 → 跳过该行 + 告警(它的 role 列照样截断配对窗口)
+            2. executed_keys 行 JSON 坏 / 存的 tool_call_id 对不上 → 按未命中处理
+            3. tool_call 的 id 是空串 → 照常按 (seq, idx) 查表;get_executed_result
+               不再有空 key 守卫,空 id 是合法输入
             4. 幂等表里的 content 不是 str → 按未命中处理
                  (这条最阴:抛的是 pydantic ValidationError,不是 PersistenceError,
                   _db_guard 拦不住、__main__ 也接不住)
@@ -444,15 +566,17 @@ class MiniSessionDB:
         """
         with self._db_guard(f"recover(session={session_id})"):
             with self._read() as c:
-                rows = c.execute(
-                    "SELECT seq, content FROM messages WHERE session_id = ? ORDER BY seq;",
+                # role 列单独取出来:坏行解析不了,但它的 role 仍然要参与窗口截断
+                db_rows = c.execute(
+                    "SELECT seq, role, content FROM messages "
+                    "WHERE session_id = ? ORDER BY seq;",
                     (session_id,),
                 ).fetchall()
 
-        messages: list[Message] = []
-        for row in rows:
+        rows: list[tuple[int, str, Message | None]] = []
+        for row in db_rows:
             try:
-                messages.append(Message.model_validate_json(row["content"]))
+                msg = Message.model_validate_json(row["content"])
             except (ValidationError, ValueError) as e:
                 # ValueError 覆盖 JSONDecodeError;两者都属于"这一行的数据坏了"
                 logger.warning(
@@ -461,53 +585,109 @@ class MiniSessionDB:
                     row["seq"],
                     e,
                 )
+                msg = None
+            # ★ role 列和 JSON 里的 role 必须一致,不一致按坏行处理(msg=None)。
+            #   窗口截断看的是 role 列,认领看的是 msg.role —— 两个来源一旦打架,
+            #   一条 JSON 是 tool、列写着 user 的行就会被当普通消息原样留下:一条
+            #   不跟在 assistant 后面的 tool 消息,之后**每次**请求都 400,会话报废
+            #   且没有任何异常。统一成"列说了算、JSON 对不上就是坏行",两边口径一致。
+            if msg is not None and msg.role != row["role"]:
+                logger.warning(
+                    "recover: 消息行 role 列(%s)与内容(%s)不一致,按坏行跳过 session=%s seq=%s",
+                    row["role"], msg.role, session_id, row["seq"],
+                )
+                msg = None
+            rows.append((row["seq"], row["role"], msg))
 
-        return self._sanitize_dangling_tool_calls(messages)
+        return self._sanitize_dangling_tool_calls(session_id, rows)
 
     # ---------- 幂等表:两个方法分别用于获取 tool 结果和记录 tool 结果 ----------
+    #
+    # ★ 键是 (session_id, assistant_seq, tool_index),**里面不含任何模型输入**。
+    #   旧键就是模型给的 tool_call.id:不同会话撞 id → 一个会话读到另一个会话的工具
+    #   输出;同一会话跨轮复用 id → 第 3 轮的写入被吞、恢复时拿回第 1 轮的结果。
+    #   id 的格式和唯一性我们控制不了,也不该依赖。现在键全由我们自己的数据构成:
+    #   assistant_seq 是 append_message 分配的,tool_index 是 tool_calls 的下标
+    #   (随 JSON 原样落库、按这个顺序串行执行,两边天然对齐)。
+    #   外键 (session_id, assistant_seq) → messages 让数据库保证每条记录都指向一条
+    #   真实存在的消息。tool_call_id 只作普通列,读侧拿来做一致性比对 + 排查用。
 
-    def get_executed_result(self, key: str) -> dict | None:
+    def get_executed_result(
+        self,
+        session_id: str,
+        assistant_seq: int,
+        tool_index: int,
+        expected_tool_call_id: str,
+    ) -> dict | None:
         """查幂等缓存。命中返回 result dict,未命中返回 None。纯读,不开写事务。
 
-        损坏的行按「未命中」处理,不抛。理由:本方法唯一的调用方是 recover 的补桩
-        分支,它对 None 的语义已经是「查不到真结果,补 interrupted 桩」——一行坏
-        JSON 的正确降级就是走同一条路。recover 对 messages 表的坏行也是跳过+告警,
-        两张表的容错态度必须一致,否则一行脏数据就能打死整个 --resume。
+        以下都按「未命中」处理,告警但不抛:
+          - 行不存在;
+          - 行的 JSON 坏了;
+          - ★ 存的 tool_call_id 和 expected_tool_call_id 不一致。位置对上了、id 对不上,
+            说明这条记录描述的不是我们以为的那次调用(数据被改过、或写侧有 bug)。
+            宁可补一个 interrupted 桩让模型自己判断,也不把一个可能张冠李戴的结果
+            喂回去。这是 tool_call_id 不进主键、却仍然要存的全部理由:纵深防御。
+
+        ★ 不再有"空 key"守卫。 键里不含 id,空 id 只是一个参与比对的普通值。
+          本方法唯一的调用方是 recover 的补桩分支,传进来的是**从库里读出的历史数据**
+          —— 守卫在这里会把一次数据异常升级成 PersistenceError,让会话永久 --resume
+          不了。
+
+        损坏的行按「未命中」处理而不是抛,理由同上:recover 对 None 的语义已经是
+        「查不到真结果,补 interrupted 桩」—— 一行坏 JSON 的正确降级就是走同一条路。
+        recover 对 messages 表的坏行也是跳过+告警,两张表的容错态度必须一致。
         ★ json.loads 必须留在 _db_guard **外面**:guard 里有一个
           except json.JSONDecodeError 分支,放进去会被它抢先翻译成
           PersistenceError,下面这个 except ValueError 就永远接不到了。
         """
-        if not key:
-            raise PersistenceError("get_executed_result: key 不能为空")
-
-        with self._db_guard(f"get_executed_result(key={key})"):
+        where = f"session={session_id}, seq={assistant_seq}, idx={tool_index}"
+        with self._db_guard(f"get_executed_result({where})"):
             with self._read() as c:
                 row = c.execute(
-                    "SELECT result FROM executed_keys WHERE idempotency_key = ?;", (key,)
+                    "SELECT tool_call_id, result FROM executed_keys "
+                    "WHERE session_id = ? AND assistant_seq = ? AND tool_index = ?;",
+                    (session_id, assistant_seq, tool_index),
                 ).fetchone()
             if row is None:
                 return None
-            raw = row["result"]
+            stored_id, raw = row["tool_call_id"], row["result"]
+
+        if stored_id != expected_tool_call_id:
+            logger.warning(
+                "get_executed_result: %s 存的 tool_call_id=%r 与期望的 %r 不一致,"
+                "按未命中处理", where, stored_id, expected_tool_call_id,
+            )
+            return None
 
         try:
             return json.loads(raw)
         except ValueError as e:
             # ValueError 覆盖 JSONDecodeError
             logger.warning(
-                "get_executed_result: 幂等表行损坏 key=%s,按未命中处理: %s", key, e
+                "get_executed_result: 幂等表行损坏 %s,按未命中处理: %s", where, e
             )
             return None
 
     def record_executed_key(
-        self, key: str, session_id: str, result: dict
+        self,
+        session_id: str,
+        assistant_seq: int,
+        tool_index: int,
+        tool_call_id: str,
+        result: dict,
     ) -> tuple[bool, dict]:
         """
         返回 (is_first, canonical_result)。
-        - 用 ON CONFLICT(idempotency_key) DO NOTHING,看 rowcount 判断 is_first。
+        - 用 ON CONFLICT(session_id, assistant_seq, tool_index) DO NOTHING,
+          看 rowcount 判断 is_first。
         - is_first=True  → canonical 就是你传进来的 result
         - is_first=False → 把表里那条已存在的 result 读出来返回(它才是权威值)
           ★ 关键:这个"读回来"的 SELECT,必须和上面的 INSERT 在同一个
             BEGIN IMMEDIATE 事务里 —— 否则读到的可能不是你刚撞上的那一条。
+        - assistant_seq 必须是一条已落库的消息(外键),否则 PersistenceError。
+          写入顺序天然满足:assistant 先落库,工具后执行。
+        - tool_call_id 原样存,空串也存:它不参与主键,只供读侧比对。
         """
         if not isinstance(result, dict):
             raise PersistenceError("record_executed_key: result应该为字典格式")
@@ -522,31 +702,49 @@ class MiniSessionDB:
                 f"record_executed_key: result 不可 JSON 序列化: {e}"
             ) from e
 
-        with self._db_guard(f"record_executed_key(key={key})"):
+        where = f"session={session_id}, seq={assistant_seq}, idx={tool_index}"
+        with self._db_guard(
+            f"record_executed_key({where})",
+            hint="(IntegrityError 通常是 assistant_seq 指向的消息不存在)",
+        ):
             with self._write_txn() as c:
                 cur = c.execute(
                     "INSERT INTO executed_keys "
-                    "(idempotency_key, session_id, result, created_at) "
-                    "VALUES (?, ?, ?, ?) "
-                    "ON CONFLICT(idempotency_key) DO NOTHING;",
-                    (key, session_id, result_json, int(time.time())),
+                    "(session_id, assistant_seq, tool_index, tool_call_id, result, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(session_id, assistant_seq, tool_index) DO NOTHING;",
+                    (session_id, assistant_seq, tool_index, tool_call_id,
+                     result_json, int(time.time())),
                 )
                 if cur.rowcount == 1:
                     return True, result
 
-                # rowcount == 0 → 这个 key 已经存在,读回权威结果
+                # rowcount == 0 → 这个位置已经记过了,读回权威结果
                 # 把 INSERT 和 SELECT 放同一个事务里,原因:
                 # 1. 少一次锁获取、少一次事务开销。事务已经开着了,SELECT 顺手就做了
                 # 2. (更重要)不要让代码的正确性,依赖一个"读代码的人看不见的假设"。
                 row = c.execute(
-                    "SELECT result FROM executed_keys WHERE idempotency_key = ?;",
-                    (key,),
+                    "SELECT result FROM executed_keys "
+                    "WHERE session_id = ? AND assistant_seq = ? AND tool_index = ?;",
+                    (session_id, assistant_seq, tool_index),
                 ).fetchone()
                 if row is None:
                     raise PersistenceError(
-                        f"executed_keys 不变量被破坏: key={key} 冲突但不存在"
+                        f"executed_keys 不变量被破坏: {where} 冲突但不存在"
                     )
-                return False, json.loads(row["result"])
+                raw = row["result"]
+
+        # ★ json.loads 留在 _db_guard 外面,理由同 get_executed_result:放进去会被
+        #   guard 的 JSONDecodeError 分支翻译成 PersistenceError —— 而走到这里时工具
+        #   **已经执行完了**,为一行坏掉的旧记录让整轮失败是最坏的取舍。降级成空
+        #   dict:调用方拿不到 str 的 content,就退回用本次的新结果并告警。
+        try:
+            return False, json.loads(raw)
+        except ValueError as e:
+            logger.warning(
+                "record_executed_key: 权威行损坏 %s,按无权威值处理: %s", where, e
+            )
+            return False, {}
 
     # ---------- 消息落库 ----------
 

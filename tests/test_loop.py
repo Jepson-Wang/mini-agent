@@ -5,10 +5,40 @@
 """
 from __future__ import annotations
 
+import json
+import logging
+
 import pytest
 
-from mini_agent.agent import Agent
+from mini_agent.agent import Agent, _Turn
+from mini_agent.schema import Message, ToolCall
+from mini_agent.tools.registry import registry
 from tests.conftest import FakeMessage
+
+
+class FakeToolCall:
+    """长得像 openai SDK 的 tool_call（ToolCall.from_openai 要 .id/.function）。"""
+
+    def __init__(self, call_id: str, name: str, args: dict):
+        self.id = call_id
+        self.type = "function"
+        self.function = type(
+            "F", (), {"name": name, "arguments": json.dumps(args)}
+        )()
+
+
+@pytest.fixture
+def loop_echo():
+    """一个确定性的工具，用完摘掉。注册表是模块级单例，不清理会漏到别的测试里。"""
+    registry.register(
+        name="loop_echo",
+        toolset="looptest",
+        description="原样回显",
+        schema={"type": "object", "properties": {"text": {"type": "string"}}},
+        handler=lambda text="": f"echoed:{text}",
+    )
+    yield "loop_echo"
+    registry._tools.pop("loop_echo", None)
 
 
 def test_retry_after_failure_does_not_duplicate_the_user_message(db, monkeypatch):
@@ -146,3 +176,77 @@ def test_budget_exhaustion_stops(db, monkeypatch):
     assert out["completed"] is False
     assert out["used_turns"] == 3
     assert "budget" in out["final_response"]
+
+
+def test_duplicate_execution_uses_canonical_result_and_warns(
+    db, loop_echo, caplog, monkeypatch
+):
+    """同一个 (session, assistant_seq, idx) 撞键时，tool 消息必须用幂等表里的权威结果。
+
+    新键完全由服务端数据构成，单写者走 run_conversation 根本撞不上，所以这里
+    手工先记一行、再直接调 _execute_tool_calls，模拟"同一条 assistant 的 tool_calls 被重放"。
+    若 tool 消息用本次的新结果，幂等表和 transcript 就分叉了：崩溃恢复补回来的
+    是"权威结果"，正常路径落的却是另一个答案。
+    """
+    # mini_agent 根 logger 关了 propagate，caplog 的 handler 挂在全局 root 上收不到
+    monkeypatch.setattr(logging.getLogger("mini_agent"), "propagate", True)
+    sid = db.create_session()
+    agent = Agent(db=db)
+
+    assistant = Message(
+        role="assistant",
+        tool_calls=[ToolCall(id="call_0", name=loop_echo, arguments={"text": "新结果"})],
+    )
+    assistant_seq = db.append_message(sid, assistant)
+    db.record_executed_key(sid, assistant_seq, 0, "call_0", {"content": "权威结果"})
+
+    turn = _Turn(session_id=sid, messages=[assistant])
+    with caplog.at_level("WARNING", logger="mini_agent.agent"):
+        agent._execute_tool_calls(turn, assistant, assistant_seq)
+
+    tool_msgs = [m for m in db.recover(sid) if m.role == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].tool_call_id == "call_0"
+    assert tool_msgs[0].content == "权威结果"          # ← 不是 "echoed:新结果"
+    assert turn.messages[-1].content == "权威结果"     # 内存副本和库一致
+    assert "被执行了第二次" in caplog.text
+
+
+def test_reused_tool_call_id_across_turns_pairs_each_with_its_own_result(
+    fake_llm, db, loop_echo
+):
+    """模型在两轮里复用同一个 tool_call id，每个 assistant 只能配到自己那轮的结果。
+
+    旧实现两处都会错：幂等表按 id 全局去重，第二轮的写入被 DO NOTHING 吞掉；
+    recover 用全会话的 {tool_call_id: msg} 建索引，后写的覆盖先写的，第一轮的
+    assistant 会认领第二轮的结果。无状态化后每次 run_conversation 都走 recover，
+    所以这**不需要崩溃**，正常跑两轮就会让模型看到错位的历史。
+    """
+    llm = fake_llm([
+        FakeMessage(tool_calls=[FakeToolCall("call_0", loop_echo, {"text": "first"})]),
+        FakeMessage(content="done-1"),
+        FakeMessage(tool_calls=[FakeToolCall("call_0", loop_echo, {"text": "second"})]),
+        FakeMessage(content="done-2"),
+    ])
+    agent = Agent(db=db, toolset={"looptest"})
+
+    agent.run_conversation("sess_1", "q1")
+    agent.run_conversation("sess_1", "q2")
+
+    history = db.recover("sess_1")
+    assert [m.role for m in history] == [
+        "user", "assistant", "tool", "assistant",
+        "user", "assistant", "tool", "assistant",
+    ]
+    assert history[2].tool_call_id == "call_0"
+    assert history[2].content == "echoed:first"
+    assert history[6].tool_call_id == "call_0"
+    assert history[6].content == "echoed:second"
+    assert [m.content for m in history if m.role != "tool"] == [
+        "q1", None, "done-1", "q2", None, "done-2",
+    ]
+
+    # 第二轮最后一次调用发给模型的上下文里，两条 tool 结果也必须各归各位
+    last_sent = llm.calls[3]["messages"]
+    tool_contents = [m["content"] for m in last_sent if m["role"] == "tool"]
+    assert tool_contents == ["echoed:first", "echoed:second"]

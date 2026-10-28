@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import logging
 
 import pytest
 
@@ -179,7 +178,7 @@ def test_budget_exhaustion_stops(db, monkeypatch):
 
 
 def test_duplicate_execution_uses_canonical_result_and_warns(
-    db, loop_echo, caplog, monkeypatch
+    db, loop_echo, caplog
 ):
     """同一个 (session, assistant_seq, idx) 撞键时，tool 消息必须用幂等表里的权威结果。
 
@@ -188,8 +187,6 @@ def test_duplicate_execution_uses_canonical_result_and_warns(
     若 tool 消息用本次的新结果，幂等表和 transcript 就分叉了：崩溃恢复补回来的
     是"权威结果"，正常路径落的却是另一个答案。
     """
-    # mini_agent 根 logger 关了 propagate，caplog 的 handler 挂在全局 root 上收不到
-    monkeypatch.setattr(logging.getLogger("mini_agent"), "propagate", True)
     sid = db.create_session()
     agent = Agent(db=db)
 

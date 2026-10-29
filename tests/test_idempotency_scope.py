@@ -413,12 +413,12 @@ def _columns(path: str, table: str) -> set[str]:
 
 def test_new_db_is_stamped_with_schema_version(db_path):
     MiniSessionDB(db_path)
-    assert _user_version(db_path) == SCHEMA_VERSION == 1
+    assert _user_version(db_path) == SCHEMA_VERSION
     assert "tool_index" in _columns(db_path, "executed_keys")
 
 
 def test_legacy_db_is_migrated_and_old_table_kept(db_path):
-    """旧库打开后：版本升到 1，旧表改名保留（不做不可逆的事），新表可读写。"""
+    """旧库打开后：版本升到当前版本，旧表改名保留（不做不可逆的事），新表可读写。"""
     _make_legacy_db(db_path)
 
     db = MiniSessionDB(db_path)

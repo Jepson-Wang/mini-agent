@@ -14,6 +14,7 @@ from mini_agent.persistence.schema import (
     SESSION_CREATE_SQL,
     MESSAGES_CREATE_SQL,
     EXECUTED_KEYS_CREATE_SQL,
+    COMPACTIONS_CREATE_SQL,
 )
 from mini_agent.schema import Message
 
@@ -27,7 +28,8 @@ class PersistenceError(Exception):
 _VALID_ROLES = {"system", "user", "assistant", "tool"}
 
 # _create_tables 用它判断"表是否已就绪"，从而跳过写锁。改动建表语句时要同步改这里。
-_TABLES = ("sessions", "messages", "executed_keys")
+# _TABLES 里的表缺一不可：版本对但缺表(比如手工 DROP 过)→ 走慢路径用 IF NOT EXISTS 补齐。
+_TABLES = ("sessions", "messages", "executed_keys", "compactions")
 
 # 旧版 executed_keys 迁移时改名到这里。只改名不 DROP：自动迁移不该做不可逆的事。
 _LEGACY_EXECUTED_KEYS = "executed_keys_legacy_v0"
@@ -184,9 +186,12 @@ class MiniSessionDB:
         ★ 兼做 schema 迁移,版本号存在 PRAGMA user_version 里(见 schema.SCHEMA_VERSION)。
           SQLite 改不了已有表的主键,executed_keys 换主键只能重建表,所以必须有
           版本号来区分"新库 / 旧库 / 已迁移的库"。
+          v1→v2 是纯加法(只多一张 compactions),现有收敛式慢路径不用改结构;
+          v0 库一次打开直接一路收敛到 v2。
 
-        快路径(只拿读锁):版本对、三张表齐 → 直接返回。版本比代码认识的还新
-        (用新库跑旧代码)→ 抛 PersistenceError,不去猜那份结构该怎么用。
+        快路径(只拿读锁):版本对、_TABLES 里的表齐 → 直接返回。版本比代码认识的还新
+        (库已被更新版本的代码写过,用新库跑旧代码)→ 抛 PersistenceError,不去猜那份结构
+        该怎么用、不带病运行。
 
         慢路径(BEGIN IMMEDIATE):**再查一次**版本(double-checked)。两个进程
         可能同时在快路径上看到旧版本,但写锁让它们串行,后到的那个二次检查时
@@ -210,15 +215,17 @@ class MiniSessionDB:
                 c.execute(SESSION_CREATE_SQL)
                 c.execute(MESSAGES_CREATE_SQL)
                 c.execute(EXECUTED_KEYS_CREATE_SQL)
+                # 必须在 messages 之后建:它外键引用 messages(session_id, seq)
+                c.execute(COMPACTIONS_CREATE_SQL)
                 # ★ PRAGMA 不接受 ? 占位符,只能把整数常量拼进 SQL。
                 #   SCHEMA_VERSION 是代码里的 int 常量,不是外部输入,没有注入面。
                 c.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)};")
 
     @staticmethod
     def _schema_is_current(c: sqlite3.Connection) -> bool:
-        """版本 == SCHEMA_VERSION 且三张表齐全。版本更新则直接拒绝。
+        """版本 == SCHEMA_VERSION 且 _TABLES 里的表齐全。版本更新则直接拒绝。
 
-        版本对了还要数表,是因为"版本 1 但缺表"也可能出现(有人手工删了表),
+        版本对了还要数表,是因为"版本对但缺表"也可能出现(有人手工删了表),
         那种情况让慢路径用 IF NOT EXISTS 补齐即可。
         """
         version = c.execute("PRAGMA user_version;").fetchone()[0]

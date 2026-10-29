@@ -59,8 +59,8 @@ def main() -> None:
         # messages。recover 应当从幂等表把**真结果**捞回来，而不是补桩——补桩会害
         # 模型以为没发成、再发一遍邮件。这个窗口就是幂等表存在的全部理由。
         db.append_message(sid, Message(role="user", content="发封邮件"))
-        db.append_message(sid, Message(role="assistant", tool_calls=[_tc(1)]))
-        db.record_executed_key("call_1", sid, {"content": "邮件已发送"})
+        seq = db.append_message(sid, Message(role="assistant", tool_calls=[_tc(1)]))
+        db.record_executed_key(sid, seq, 0, "call_1", {"content": "邮件已发送"})
         _signal_ready(sentinel, sid)
 
     elif mode == "churn":
@@ -71,8 +71,8 @@ def main() -> None:
         _signal_ready(sentinel, sid)
         for i in range(_MAX_ROUNDS):
             db.append_message(sid, Message(role="user", content=f"q{i}"))
-            db.append_message(sid, Message(role="assistant", tool_calls=[_tc(i)]))
-            db.record_executed_key(f"call_{i}", sid, {"content": f"r{i}"})
+            seq = db.append_message(sid, Message(role="assistant", tool_calls=[_tc(i)]))
+            db.record_executed_key(sid, seq, 0, f"call_{i}", {"content": f"r{i}"})
             db.append_message(
                 sid, Message(role="tool", tool_call_id=f"call_{i}", content=f"r{i}")
             )

@@ -211,9 +211,9 @@ class Agent:
             据此判定"这回合结束了"，下一轮的用户输入就能正常落库；
           - 内容如实写明被取消，下一轮模型看得见"上一件事被叫停了"，这本就是它
             该有的上下文；
-          - 残缺的 tool 配对不必在这里补 —— 下一轮 recover 会按 tool_call_id
-            统一补桩，补出来的位置紧跟在 assistant(tool_calls) 后面，仍然合法，
-            这条封口消息排在它们之后。
+          - 残缺的 tool 配对不必在这里补 —— 下一轮 recover 会按 assistant 窗口
+            统一补桩（封口消息不是 tool，正好截断窗口），补出来的位置紧跟在
+            assistant(tool_calls) 后面，仍然合法，这条封口消息排在它们之后。
 
         写库失败只记日志、不抛：这条路径本身是在处理取消，再抛一个新异常只会把
         "任务被取消了"这个真正的结局盖掉。
@@ -225,15 +225,19 @@ class Agent:
 
     # ---------- 内部：落库 + 工具 ----------
 
-    def _record(self, turn: _Turn, msg: Message) -> None:
-        """把一条 Message 同时写进本轮内存和库。
+    def _record(self, turn: _Turn, msg: Message) -> int:
+        """把一条 Message 同时写进本轮内存和库，返回它在库里的 seq。
 
         M2 的核心：每产生一条消息就立刻落库，崩溃时丢的最多是"最后一条还没写完
         的"。append_message 失败会抛 PersistenceError —— 故意不吞：内存和库一旦
         静默分叉，崩溃恢复就失去意义（fail-fast）。
+
+        返回 seq 是给幂等键用的：assistant(tool_calls) 的 seq 是
+        (session_id, assistant_seq, tool_index) 里我们自己掌握的那一维，
+        见 _execute_tool_calls。其余调用方忽略返回值即可。
         """
         turn.messages.append(msg)
-        self.db.append_message(turn.session_id, msg)
+        return self.db.append_message(turn.session_id, msg)
 
     def _tool_defs(self) -> Optional[list[dict]]:
         """本轮要暴露给模型的工具列表。无 toolset → None（等价 M0，不带工具）。"""
@@ -247,17 +251,39 @@ class Agent:
         raw = call_llm(api_msgs, tools=tools)
         return Message.from_openai(raw)
 
-    def _execute_tool_calls(self, turn: _Turn, assistant: Message) -> None:
+    def _execute_tool_calls(
+        self, turn: _Turn, assistant: Message, assistant_seq: int
+    ) -> None:
         """串行执行 assistant 的每个 tool_call，把结果作为 role="tool" 回填。
+
+        assistant_seq 是这条 assistant 刚落库时 append_message 给的 seq。
 
         ★ 配对铁律：带 tool_calls 的 assistant 后面，必须紧跟"数量一致、
         tool_call_id 一一对应"的 tool 消息，否则下一次请求会 400。串行执行、
         每个 tc 都回填一条，天然满足；关键是**一个都不能漏**。
 
         ★ 写入顺序（②在③前）：先记幂等表、再落 tool 结果。若崩在这两步之间，
-        recover 能按 tool_call_id 从幂等表查回真结果补桩，不必重跑有副作用的工具。
+        recover 能从幂等表查回真结果补桩，不必重跑有副作用的工具。
+        幂等键是 (session_id, assistant_seq, tool_index)，**完全由服务端数据构成，
+        不含任何模型输入**。以前用模型给的 tc.id 当全局键，模型一复用 id（跨会话
+        撞、同会话跨轮撞），后写的就被 DO NOTHING 吞掉，恢复时拿回的是别人的结果。
+        tc.id 只作为普通列存着，供 recover 读侧校验"存的和当前的是不是同一个"。
+        tool_index 能当键，是因为 assistant.tool_calls 的顺序随 JSON 原样落库，
+        这里又按同一顺序串行执行，两边天然对齐。
+        （M6 若改成并行执行：idx 必须在提交任务**之前**就绑定到每个 tc 上，
+        tool 消息也要按 idx 顺序落库，不能按完成顺序 —— 否则对齐就断了。）
         result 包成 {"content": result} 是因为 dispatch 返回的是裸字符串（不一定是
         JSON），而幂等表按 dict 存、recover 按 cached["content"] 取——两头必须对齐。
+
+        ★ is_first=False 不能静默吞掉。 新键下正常路径根本撞不上：哪怕同一会话被
+        两个回合并发跑，它们各自 append_message、拿到的 assistant_seq 也必然不同。
+        能撞上只有一种情况：**同一条已落库的 assistant 的 tool_calls 被重放了**
+        （重试 / 重放类 bug，或日后有人写了"重跑悬空调用"的逻辑）—— 也就是有副作用的
+        工具真的执行了第二次。这是必须被看见的信号。
+        此时 tool 消息改用表里的权威结果（先写者赢），保证幂等表和 transcript
+        永远一致，否则崩溃恢复补回来的和正常路径落的会是两个不同的答案。
+        权威值的 content 不是 str（脏数据）时退回本次结果并告警，绝不抛：工具已经
+        跑完了，为一行脏数据把整轮打死只会更糟。
 
         ★ 取消点在 dispatch **之前**，一个都不放在之后。 在这里中断会留下一轮
         配对残缺的 transcript（assistant 有 tool_calls，tool 结果缺几条），那正是
@@ -266,14 +292,33 @@ class Agent:
         对有副作用的工具，下次 recover 只能从幂等表捞，捞不到就得重跑。放前面则
         这个工具压根没启动过，没有任何东西需要善后。
         """
-        for tc in assistant.tool_calls:
+        for idx, tc in enumerate(assistant.tool_calls):
             self._check_cancelled(turn)
             self._emit(turn, "tool_call", json.dumps(
                 {"id": tc.id, "name": tc.name, "arguments": tc.arguments},
                 ensure_ascii=False,
             ))
             result = registry.dispatch(tc.name, tc.arguments)
-            self.db.record_executed_key(tc.id, turn.session_id, {"content": result})
+            is_first, canonical = self.db.record_executed_key(
+                turn.session_id, assistant_seq, idx, tc.id, {"content": result}
+            )
+            if not is_first:
+                cached = canonical.get("content") if isinstance(canonical, dict) else None
+                if isinstance(cached, str):
+                    logger.warning(
+                        "同一个 (session, assistant_seq, idx) 被执行了第二次（同一条"
+                        "assistant 的 tool_calls 被重放）；改用幂等表里的权威结果 "
+                        "session=%s assistant_seq=%s idx=%s tool_call_id=%s",
+                        turn.session_id, assistant_seq, idx, tc.id,
+                    )
+                    result = cached
+                else:
+                    logger.warning(
+                        "同一个 (session, assistant_seq, idx) 被执行了第二次（同一条"
+                        "assistant 的 tool_calls 被重放）；权威结果的 content 不是 str，保留本次结果 "
+                        "session=%s assistant_seq=%s idx=%s tool_call_id=%s",
+                        turn.session_id, assistant_seq, idx, tc.id,
+                    )
             self._record(turn, Message(role="tool", tool_call_id=tc.id, content=result))
             self._emit(turn, "tool_result", json.dumps(
                 {"id": tc.id, "name": tc.name, "content": result},
@@ -343,7 +388,7 @@ class Agent:
             # 中断不留任何需要 recover 善后的残缺轮。
             self._check_cancelled(turn)
             assistant = self._call_model(turn, self._tool_defs())
-            self._record(turn, assistant)
+            assistant_seq = self._record(turn, assistant)
 
             # 带 tool_calls 时 content 是模型的"我打算干什么"，纯文本时它就是
             # 最终答案 —— 后者由 finished 事件带走，这里只报前者，避免重复推送。
@@ -357,7 +402,7 @@ class Agent:
                     "used_turns": budget.used,
                 }
 
-            self._execute_tool_calls(turn, assistant)   # 执行 + 回填，然后回循环顶
+            self._execute_tool_calls(turn, assistant, assistant_seq)   # 执行 + 回填，然后回循环顶
 
         # 预算耗尽：给最后一次机会，强制不带 tools 逼模型收尾成文本。
         # 此时 turn.messages 以一组 tool 结果结尾（合法可发送状态）。

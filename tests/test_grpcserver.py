@@ -20,6 +20,7 @@ import pytest
 import mini_agent.agent as agent_mod
 from mini_agent.agent import Agent, CANCELLED_MARKER
 from mini_agent.gen.agent.v1 import agent_pb2, agent_pb2_grpc
+from mini_agent.llm import LLMReply
 from mini_agent.persistence.session_db import PersistenceError
 from mini_agent.grpcserver.server import (
     AgentServicer,
@@ -94,6 +95,11 @@ class Msg:
         self.role = "assistant"
         self.content = content
         self.tool_calls = tool_calls
+
+
+def _reply(msg) -> LLMReply:
+    """把 Msg 包成 call_llm 的真实返回形状；不带 usage，与上游没给用量一致。"""
+    return LLMReply(message=msg, usage=None)
 
 
 def run_task(stub, task_uid: str, session_id: str, text: str) -> list:
@@ -189,10 +195,10 @@ def test_budget_exhausted_reports_error_not_finished(serve):
     """
     step = iter(range(1000))
     stub, _ = serve(
-        lambda messages, tools=None: Msg(
+        lambda messages, tools=None: _reply(Msg(
             content="还要调",
             tool_calls=[FakeToolCall(f"c{next(step)}", "echo", {"text": "x"})],
-        ),
+        )),
         max_turns=3,
     )
 
@@ -308,9 +314,9 @@ def test_same_session_tasks_are_serialized(serve, db):
                 next(m for m in messages if m.get("content") == last_user)):]
         )
         if called:
-            return Msg(content=f"答案-{last_user}")
-        return Msg(content=f"想-{last_user}",
-                   tool_calls=[FakeToolCall(f"{last_user}-c", "echo", {"text": "x"})])
+            return _reply(Msg(content=f"答案-{last_user}"))
+        return _reply(Msg(content=f"想-{last_user}",
+                          tool_calls=[FakeToolCall(f"{last_user}-c", "echo", {"text": "x"})]))
 
     stub, _ = serve(llm)
 
@@ -333,8 +339,8 @@ def test_different_sessions_run_concurrently(serve, db):
     """不同 session 之间不该互相串扰，也不该被 session 锁挡住。"""
     def llm(messages, tools=None):
         time.sleep(0.2)
-        return Msg(content="答-" + [m["content"] for m in messages
-                                    if m.get("role") == "user"][-1])
+        return _reply(Msg(content="答-" + [m["content"] for m in messages
+                                           if m.get("role") == "user"][-1]))
 
     stub, _ = serve(llm)
 
@@ -391,7 +397,7 @@ def iter_llm(scripted: list, delay: float = 0.0):
     def _call(messages, tools=None):
         if delay:
             time.sleep(delay)
-        return box.pop(0) if box else Msg(content="(脚本用尽)")
+        return _reply(box.pop(0) if box else Msg(content="(脚本用尽)"))
 
     return _call
 
@@ -408,10 +414,10 @@ def endless_tools(delay: float = 0.4):
 
     def _call(messages, tools=None):
         time.sleep(delay)
-        return Msg(
+        return _reply(Msg(
             content="继续干活",
             tool_calls=[FakeToolCall(f"c{next(step)}", "echo", {"text": "x"})],
-        )
+        ))
 
     return _call
 

@@ -73,6 +73,15 @@ class Settings:
     # 文件工具的沙箱根，见 DEFAULT_WORKSPACE_NAME。真正取值走 workspace_root()。
     workspace: Path = DEFAULT_HOME / DEFAULT_WORKSPACE_NAME
 
+    # ---- M3 上下文压缩 ----
+    # 模型的上下文上限（token）。★ 128000 是**占位值**，尚未对照 DeepSeek 文档
+    # 确认 deepseek-v4-flash 的真实上限。它只影响"提前多久压"：估小了会压得
+    # 更勤（更费一次总结调用），估大了会压得太晚。上线前必须核实。
+    context_window: int = 128_000
+    # 用量达到 context_window × 该比例就触发压缩。0.5 的含义是"留一半余量"：
+    # 压缩本身要花一次 LLM 调用，模型也可能一次吐出很长的回答。
+    compress_trigger_ratio: float = 0.5
+
     # ---- gRPC surface（mini_agent/grpcserver）----
     grpc_port: int = 50051              # 要和 Go 那边的 AGENT_ADDR 对上
     # 并发上限。一个任务占**两个**线程：gRPC 的 handler 线程（跑生成器、发事件）
@@ -124,6 +133,43 @@ def _num_env(name: str, default, cast):
         return default
 
 
+def _ratio_env(name: str, default: float) -> float:
+    """读触发比例：必须是 (0, 1) 开区间，否则退回默认值并告警。
+
+    为什么不能只靠 _num_env：它能解析出任意 float，而 ratio ≤ 0 意味着"每次
+    请求前都压"（每轮多一次总结调用，甚至压完还是超），ratio ≥ 1 意味着"永不
+    触发"（直到 400）。两个坏值都不会报错，只会悄悄把行为变成另一种。
+    所以边界在这里挡掉 —— 和 _num_env 一样，打 stderr，不 import log（会成环）。
+    """
+    value = _num_env(name, default, float)
+    if not (0.0 < value < 1.0):
+        print(
+            f"[config] 环境变量 {name}={value!r} 不在 (0, 1) 区间内，"
+            f"退回默认值 {default}",
+            file=sys.stderr,
+        )
+        return default
+    return value
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """读正整数：解析失败或 ≤ 0 都退回默认值并告警。
+
+    和 _ratio_env 挡的是同一类坏值。context_window ≤ 0 时阈值
+    （window × ratio）也 ≤ 0，于是**每次请求前都判定要压缩**：每轮多一次总结
+    调用，压完还超、每次都告警，进程不报任何错，只是悄悄变了个行为。
+    """
+    value = _num_env(name, default, int)
+    if value <= 0:
+        print(
+            f"[config] 环境变量 {name}={value!r} 必须是正整数，"
+            f"退回默认值 {default}",
+            file=sys.stderr,
+        )
+        return default
+    return value
+
+
 def _workspace_from_env(home: Path) -> Path:
     """沙箱根：显式给了就用，没给就挂在 home 下面。绝不退回 cwd。"""
     raw = os.getenv("MINI_AGENT_WORKSPACE")
@@ -142,6 +188,8 @@ def _load_settings() -> Settings:
         request_timeout=_num_env("MINI_AGENT_REQUEST_TIMEOUT", 120.0, float),
         home=home,
         workspace=_workspace_from_env(home),
+        context_window=_positive_int_env("MINI_AGENT_CONTEXT_WINDOW", 128_000),
+        compress_trigger_ratio=_ratio_env("MINI_AGENT_COMPRESS_TRIGGER_RATIO", 0.5),
         grpc_port=_num_env("MINI_AGENT_GRPC_PORT", 50051, int),
         grpc_max_workers=_num_env("MINI_AGENT_GRPC_MAX_WORKERS", 16, int),
         grpc_host=os.getenv("MINI_AGENT_GRPC_HOST", "127.0.0.1"),

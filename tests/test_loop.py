@@ -10,6 +10,7 @@ import json
 import pytest
 
 from mini_agent.agent import Agent, _Turn
+from mini_agent.llm import LLMReply
 from mini_agent.schema import Message, ToolCall
 from mini_agent.tools.registry import registry
 from tests.conftest import FakeMessage
@@ -53,7 +54,7 @@ def test_retry_after_failure_does_not_duplicate_the_user_message(db, monkeypatch
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("LLM 超时")
-        return FakeMessage(content="终于答上了")
+        return LLMReply(message=FakeMessage(content="终于答上了"), usage=None)
 
     monkeypatch.setattr("mini_agent.agent.call_llm", flaky)
     agent = Agent(db=db)
@@ -165,7 +166,7 @@ def test_budget_exhaustion_stops(db, monkeypatch):
 
         def __call__(self, messages, tools=None):
             self.calls.append(messages)
-            return forever_tool
+            return LLMReply(message=forever_tool, usage=None)
 
     monkeypatch.setattr("mini_agent.agent.call_llm", Loop())
     agent = Agent(db=db, max_turns=3)

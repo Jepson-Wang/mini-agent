@@ -21,9 +21,11 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
+from mini_agent.context.compressor import CompressionPolicy, Compressor
+from mini_agent.context.tokens import TokenCount, measure, request_fingerprint
 from mini_agent.llm import call_llm
 from mini_agent.log import get_logger
-from mini_agent.schema import Message
+from mini_agent.schema import Message, TokenUsage
 from mini_agent.tools.registry import registry, discover_builtin_tools
 
 if TYPE_CHECKING:
@@ -139,6 +141,8 @@ class Agent:
         toolset: Optional[set[str]] = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         max_turns: int = 25,
+        compressor: Optional[Compressor] = None,
+        policy: Optional[CompressionPolicy] = None,
     ):
         # db 是**必需**依赖，不再允许 None。会话历史的唯一真相在库里，没有 db
         # 就没有历史可言；而 sessions 表里的 parent_session_id/depth 说明连将来的
@@ -150,6 +154,12 @@ class Agent:
         self.toolset = toolset
         self.system_prompt = system_prompt
         self.max_turns = max_turns
+
+        # M3：上下文压缩。两个**可选**依赖，缺一个就完全不做检查（_maybe_compress
+        # 直接返回）—— 于是不传时现有行为逐字节不变，可以零风险先合并这一块，
+        # 等 compressor 的真实实现落地、两个入口各自决定接不接。
+        self.compressor = compressor
+        self.policy = policy
 
         if toolset:
             # 显式、幂等地做一次工具发现：一个"带工具的 agent"就该保证工具已注册。
@@ -246,10 +256,97 @@ class Agent:
         return registry.get_definitions(toolset=self.toolset) or None
 
     def _call_model(self, turn: _Turn, tools: Optional[list[dict]]) -> Message:
-        """拼上 system、发一次调用、解析回内部 Message。"""
+        """拼上 system、发一次调用、解析回内部 Message，并把 usage 挂上去。
+
+        ★ usage 必须落在 assistant 消息上、随 _record 一起落库。 Agent 是无状态的，
+          每次 run_conversation 都从库里 recover，内存里攒的东西活不过一次调用 ——
+          不落库的话，每次调用的**第一轮**永远没有锚点，只能整条估算（而第一轮恰好
+          是上下文最长、最需要数准的那一轮）。
+
+        ★ fingerprint 和 usage 在这里**一起**写：它描述的是"这次请求的前缀"
+          （system + 本轮 tools + 压缩边界），只有发请求的这一处同时知道这三样。
+          收尾调用 tools=None，指纹天然不同，下一轮 measure 会跳过这个锚点。
+        """
         api_msgs = [self.system_dict] + [m.to_openai() for m in turn.messages]
-        raw = call_llm(api_msgs, tools=tools)
-        return Message.from_openai(raw)
+        reply = call_llm(api_msgs, tools=tools)
+        msg = Message.from_openai(reply.message)
+        if reply.usage is not None:
+            # 注意 fingerprint 用的是**本次实际发出去的** tools，不是 self._tool_defs()：
+            # 收尾调用传的是 None，重新算一遍会得到带工具的指纹，锚点就是错的。
+            try:
+                msg.usage = TokenUsage(
+                    prompt_tokens=reply.usage.prompt_tokens,
+                    completion_tokens=reply.usage.completion_tokens,
+                    fingerprint=request_fingerprint(self.system_prompt, tools),
+                )
+            except Exception:
+                # 最后一道闸：usage 是纯遥测，构造失败只意味着"这条没有锚点"，
+                # 绝不能让一次已经成功的 LLM 调用因为它而失败。
+                logger.warning(
+                    "usage 挂到消息上失败，按无锚点处理 session=%s", turn.session_id,
+                    exc_info=True,
+                )
+        return msg
+
+    def _maybe_compress(self, turn: _Turn, tools: Optional[list[dict]]) -> None:
+        """发请求前检查一次上下文用量；超阈值就压缩，最多一次。
+
+        刻意**不返回**任何状态：压缩成功与否都不改变调用方接下来要做的事（发请求），
+        所以没有必要让它参与控制流 —— 与 _emit 同一个取向。
+
+        ★ 压缩器抛异常不能杀死任务。 压缩是优化手段，不是正确性的前提；一次失败的
+          压缩换来的是"这一轮请求偏长"，而把异常抛出去换来的是整个任务失败。
+          记日志后照常发请求。
+
+        ★ 压完还超阈值只告警、不重试。 再压一次是纯浪费（同一份历史、同样的输入、
+          大概率同样的结果），真要死循环也是在这里。真正超限的处理交给后续的
+          "400 被动兜底"。
+        """
+        if self.compressor is None or self.policy is None:
+            return
+        try:
+            count = self._measure(turn, tools)
+        except Exception:
+            # 计数本身是纯计算，正常不会抛；真抛了也只是"这轮不压"，别把请求也拖下去
+            logger.exception("上下文计数失败，跳过本轮压缩检查 session=%s", turn.session_id)
+            return
+        if not self.policy.should_compress(count):
+            return
+        try:
+            self.compressor.compress(turn)
+        except Exception:
+            logger.exception(
+                "压缩器抛异常，已忽略并继续发请求 session=%s tokens=%s source=%s",
+                turn.session_id, count.tokens, count.source,
+            )
+            return
+        # TODO[M3 下一块] 压缩之后还缺两步，缺了真实 compressor 一接上就会现形：
+        #   1) 按最新检查点从库里**重新加载** turn.messages（Compressor 的契约是
+        #      只落检查点，不改内存；不重载则 compress 等于没发生，请求原样发出）；
+        #   2) _measure 与 _call_model 传入**同一个**最新检查点的 first_kept_seq
+        #      作为 compaction_boundary（现在恒为 None，压缩前后的指纹一样，旧锚点
+        #      不会失效 —— 而压过的历史已经变了，旧 prompt_tokens 不再描述它）。
+        #   不做这两步时，"压完仍超阈值"会每次必响、且请求并不会变短。
+        try:
+            after = self._measure(turn, tools)
+        except Exception:
+            logger.exception(
+                "压缩后重新计数失败，跳过校验 session=%s", turn.session_id,
+            )
+            return
+        if self.policy.should_compress(after):
+            logger.warning(
+                "压缩后仍超过阈值，照常发请求（真超限交给 400 被动兜底）session=%s",
+                turn.session_id,
+            )
+
+    def _measure(self, turn: _Turn, tools: Optional[list[dict]]) -> TokenCount:
+        """当前 turn.messages 发出去的上下文占用估算。见 context.tokens.measure。
+
+        compaction_boundary 恒为 None：检查点的读取（recover 按检查点加载）还没做，
+        等它落地后从这里传入最新检查点的 first_kept_seq，旧锚点会自动整批失效。
+        """
+        return measure(turn.messages, self.system_prompt, tools, compaction_boundary=None)
 
     def _execute_tool_calls(
         self, turn: _Turn, assistant: Message, assistant_seq: int
@@ -387,7 +484,12 @@ class Agent:
             # 循环顶是最主要的取消点：此时 transcript 处于完整可发送状态，
             # 中断不留任何需要 recover 善后的残缺轮。
             self._check_cancelled(turn)
-            assistant = self._call_model(turn, self._tool_defs())
+            # 压缩检查放在**取消之后、发请求之前**：取消点优先（用户已经不要这次请求了，
+            # 不必再为它花一次总结调用）；而检查必须在发请求之前，否则这次的超长
+            # 请求已经发出去了，压缩只能对下一次生效、等于晚了一轮。
+            tools = self._tool_defs()
+            self._maybe_compress(turn, tools)
+            assistant = self._call_model(turn, tools)
             assistant_seq = self._record(turn, assistant)
 
             # 带 tool_calls 时 content 是模型的"我打算干什么"，纯文本时它就是
@@ -406,6 +508,8 @@ class Agent:
 
         # 预算耗尽：给最后一次机会，强制不带 tools 逼模型收尾成文本。
         # 此时 turn.messages 以一组 tool 结果结尾（合法可发送状态）。
+        # 收尾调用同样先检查：预算耗尽时上下文往往最长，这里恰恰最不该漏。
+        self._maybe_compress(turn, tools=None)
         assistant = self._call_model(turn, tools=None)
         if assistant.tool_calls:
             # 收尾调用模型还想调工具（真实场景 tools=None 不会发生）：

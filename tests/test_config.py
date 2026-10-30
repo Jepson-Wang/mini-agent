@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from mini_agent.config import DEFAULT_WORKSPACE_NAME, Settings, workspace_root
 
 
@@ -51,3 +53,30 @@ def test_default_workspace_hangs_off_home(monkeypatch):
 def test_env_overrides_workspace(monkeypatch, tmp_path):
     monkeypatch.setenv("MINI_AGENT_WORKSPACE", str(tmp_path / "ws"))
     assert workspace_root() == (tmp_path / "ws").resolve()
+
+
+# ---------------------------------------------------------------------------
+# M3：context_window 必须是正数
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw", ["0", "-5"])
+def test_non_positive_context_window_falls_back_to_default(monkeypatch, capsys, raw):
+    """window ≤ 0 时阈值也 ≤ 0 → 每次请求前都判定要压缩。
+
+    这是和 ratio 越界同一类的坏值：不报错，只悄悄把行为换成"每轮都多一次总结
+    调用、压完还超"。所以在读 env 时就挡掉，退回默认值并在 stderr 告警
+    （config 不 import log，会成环）。
+    """
+    from mini_agent.config import _positive_int_env
+
+    monkeypatch.setenv("MINI_AGENT_CONTEXT_WINDOW", raw)
+    assert _positive_int_env("MINI_AGENT_CONTEXT_WINDOW", 128_000) == 128_000
+    err = capsys.readouterr().err
+    assert "MINI_AGENT_CONTEXT_WINDOW" in err and "正整数" in err
+
+
+def test_positive_context_window_is_used(monkeypatch):
+    from mini_agent.config import _positive_int_env
+
+    monkeypatch.setenv("MINI_AGENT_CONTEXT_WINDOW", "64000")
+    assert _positive_int_env("MINI_AGENT_CONTEXT_WINDOW", 128_000) == 64_000

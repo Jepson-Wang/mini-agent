@@ -52,6 +52,10 @@ class TaskCancelled(Exception):
 # 被取消的回合在 transcript 上的封口标记，见 _seal_cancelled_turn。
 CANCELLED_MARKER = "(上一轮任务被取消，未完成)"
 
+# 预算耗尽、收尾调用仍只返回 tool_calls 且没有文本时的兜底内容。它会落库，
+# 所以下一轮模型也读得到。
+_BUDGET_EXHAUSTED = "(stopped: iteration budget exhausted)"
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are mini-agent, a helpful AI assistant with access to tools.\n"
     "When a task needs external information or an action, CALL the appropriate tool "
@@ -671,18 +675,27 @@ class Agent:
         # 收尾调用同样先检查：预算耗尽时上下文往往最长，这里恰恰最不该漏。
         self._maybe_compress(turn, tools=None)
         assistant = self._call_model(turn, tools=None)
-        if assistant.tool_calls:
-            # 收尾调用模型还想调工具（真实场景 tools=None 不会发生）：
-            # 不执行、也不 record —— 避免在 messages 末尾留下悬空的 tool_calls，
-            # 否则下一轮把它发出去就是 400。
-            return {
-                "final_response": "(stopped: iteration budget exhausted)",
-                "completed": False,
-                "used_turns": budget.used,
-            }
+        completed = not assistant.tool_calls
+        if not completed:
+            # 收尾调用模型还想调工具（真实场景 tools=None 不会发生）。两件事都得做：
+            #   · 不能原样落库 —— messages 末尾留一组悬空的 tool_calls（没有配对的
+            #     tool 结果），下一轮发出去就是 400。
+            #   · 也不能不落库 —— 那样 transcript 停在一组 tool 结果上，而
+            #     _turn_in_flight 把这种形状读成"上次崩在半路、这次是重试"，于是把
+            #     下一句真正的新用户输入当成重试跳过，用户的话被静默吞掉。这和
+            #     _seal_cancelled_turn 解决的是同一类问题：正常返回路径必须以
+            #     纯文本 assistant 收尾。
+            # 所以：剥掉 tool_calls，只留文本落库（tool_calls 本来就不会被执行）。
+            # 新消息不带 usage：tools=None 的指纹本来也做不了锚点。
+            assistant = Message(
+                role="assistant",
+                content=assistant.content or _BUDGET_EXHAUSTED,
+            )
         self._record(turn, assistant)
         return {
-            "final_response": assistant.content or "",
-            "completed": True,
+            # 未完成时 final_response 仍是固定标记：gRPC 层把它作为 error 的 payload
+            # 发给 Go（"budget" 字样是对外契约）；落库的是模型原话或同一标记。
+            "final_response": (assistant.content or "") if completed else _BUDGET_EXHAUSTED,
+            "completed": completed,
             "used_turns": budget.used,
         }

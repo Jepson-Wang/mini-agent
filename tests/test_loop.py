@@ -151,6 +151,57 @@ def test_multi_turn_keeps_history(fake_llm, db):
     assert roles == ["system", "user", "assistant", "user"]
 
 
+def test_budget_exhaustion_still_leaves_a_resumable_transcript(db, monkeypatch):
+    """预算耗尽之后，下一句**新的**用户输入必须照常落库并被回答。
+
+    _turn_in_flight 把「transcript 不以纯文本 assistant 结尾」读作「上次调用崩在
+    半路、这次是调用方在重试」，于是跳过记录 user 消息。该判据成立的前提是每条
+    正常返回路径都以纯文本 assistant 收尾；预算耗尽是正常返回路径。收尾调用
+    （tools=None）仍带 tool_calls 时若不落库，transcript 停在一组 tool 结果上，
+    下一句真正的新问题会被当成重试吞掉（与 _seal_cancelled_turn 同一类问题）。
+    """
+    def tool_msg():
+        return FakeMessage(
+            content=None,
+            tool_calls=[type("TC", (), {
+                "id": "x", "function": type("F", (), {
+                    "name": "noop", "arguments": "{}"})()})()],
+        )
+
+    # max_turns=2：2 次循环调用 + 1 次收尾调用，全部还想调工具；之后才给纯文本。
+    script = [tool_msg(), tool_msg(), tool_msg()]
+
+    def scripted(messages, tools=None):
+        msg = script.pop(0) if script else FakeMessage(content="真正的回答")
+        return LLMReply(message=msg, usage=None)
+
+    monkeypatch.setattr("mini_agent.agent.call_llm", scripted)
+    agent = Agent(db=db, max_turns=2)
+
+    first = agent.run_conversation("sess_1", "第一句")
+    assert first["completed"] is False          # 收尾调用还想调工具
+
+    # 收尾后 transcript 必须以纯文本 assistant 结尾，且没有悬空 tool_calls
+    after_first = db.recover("sess_1")
+    assert after_first[-1].role == "assistant"
+    assert not after_first[-1].tool_calls
+    assert after_first[-1].usage is None
+
+    # 用户接着说了一句完全不同的新话，不是重试
+    second = agent.run_conversation("sess_1", "第二句")
+    assert second["final_response"] == "真正的回答"
+
+    history = db.recover("sess_1")
+    users = [m.content for m in history if m.role == "user"]
+    assert users == ["第一句", "第二句"], "新的用户输入被当成重试吞掉了"
+    # 整个 transcript 里每个带 tool_calls 的 assistant 都有配对的 tool 结果
+    for i, m in enumerate(history):
+        if m.role == "assistant" and m.tool_calls:
+            ids = {t.id for t in m.tool_calls}
+            paired = {h.tool_call_id for h in history[i + 1:] if h.role == "tool"}
+            assert ids <= paired
+
+
 def test_budget_exhaustion_stops(db, monkeypatch):
     """若模型永远返回 tool_calls（M0 不该发生，但要防失控），max_turns 截断。"""
     # 造一个永远带 tool_calls 的假响应，逼循环走到预算耗尽

@@ -45,6 +45,7 @@ import grpc
 
 from mini_agent.agent import Agent, TaskCancelled
 from mini_agent.config import DEFAULT_TOOLSET, settings
+from mini_agent.context.compressor import build_compression
 from mini_agent.gen.agent.v1 import agent_pb2, agent_pb2_grpc
 from mini_agent.log import get_logger
 from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
@@ -123,6 +124,12 @@ _EVENT_TYPES = {
     "tool_result": agent_pb2.EVENT_TYPE_TOOL_RESULT,
     "finished": agent_pb2.EVENT_TYPE_FINISHED,
     "error": agent_pb2.EVENT_TYPE_ERROR,
+    # 压缩进度。proto 里还没有专门的枚举（加枚举要重新生成 gen/、Go 侧同步处理，
+    # 是跨仓库的改动），先显式按 UNSPECIFIED 发出，Go 那侧照样拿得到 payload 文本。
+    # ★ 显式登记意味着 _event 里"未登记类型"那条告警**不会**再响 —— 这是刻意的：
+    #   每次压缩都打一条告警会淹没真正的"忘了对齐"信号。等 proto 加了枚举再改映射。
+    "compacting": agent_pb2.EVENT_TYPE_UNSPECIFIED,
+    "compacted": agent_pb2.EVENT_TYPE_UNSPECIFIED,
 }
 
 # 队列里的"没有更多事件了"标记。用独一无二的哨兵对象，不用 None ——
@@ -710,7 +717,14 @@ def serve(
             f"无法打开数据库：{e}\n位置：{settings.db_path()}\n"
             f"若确认这个文件已损坏，删掉它即可重新开始（会丢失全部历史会话）。"
         )
-    agent = Agent(db=db, toolset=DEFAULT_TOOLSET, max_turns=settings.max_turns)
+    # 压缩装配和 CLI 共用 build_compression（见 config.DEFAULT_TOOLSET 的说明：
+    # 两个 surface 不能互相 import）。关闭时返回 {}，Agent 完全不介入。
+    agent = Agent(
+        db=db,
+        toolset=DEFAULT_TOOLSET,
+        max_turns=settings.max_turns,
+        **build_compression(db),
+    )
     servicer = AgentServicer(agent)
 
     server = grpc.server(

@@ -15,7 +15,7 @@
 
 为什么"锚点"需要 fingerprint：
   prompt_tokens 只在"这次请求的前缀和它当时一样"时才可信。前缀由 system prompt、
-  tool 定义、当前生效的压缩检查点决定 —— 任何一项变了，锚点的数字就不再描述
+  tool 定义、当前生效的视图状态（压缩边界 / 降级裁剪点）决定 —— 任何一项变了，锚点的数字就不再描述
   眼前这条请求。把前缀的指纹记在 usage 上，一变就整批作废、退回估算，
   不需要在压缩发生时去逐条清理旧锚点。
 """
@@ -108,25 +108,41 @@ def estimate_request(
     return total
 
 
+# view_state 的类型：(压缩边界, 降级裁剪点)，每一项可为 None。
+_VIEW_STATE = tuple[int | None, int | None]
+
+
 def request_fingerprint(
     system_prompt: str,
     tool_defs: Optional[list[dict]],
-    compaction_boundary: Optional[int] = None,
+    view_state: Optional[_VIEW_STATE] = None,
 ) -> str:
-    """请求前缀的指纹：system + tools + 压缩边界，取 sha256 前 16 位。
+    """请求前缀的指纹：system + tools + 视图状态，取 sha256 前 16 位。
 
     dict 用 sort_keys 序列化：键序不影响请求语义，不该让指纹抖动。但工具**列表**
     的顺序不排序 —— 它对模型有实际影响，宁可指纹多变几次，也不掩盖真实差异。
 
-    compaction_boundary 是当前生效的最新检查点的 first_kept_seq，还没有检查点时
-    是 None。压缩一发生它就变，旧锚点随之全部失效：压缩后的前缀已经面目全非，
-    旧的 prompt_tokens 没有参考价值。
+    view_state = (boundary, prune_before)，描述"这条请求看到的**视图**和库里的
+    原始历史差在哪"：
+      - boundary：生效的最新检查点的 first_kept_seq。压缩一发生它就变，旧锚点
+        随之全部失效 —— 前缀已经面目全非，旧的 prompt_tokens 没有参考价值；
+      - prune_before：D1 降级时旧工具输出被替换成占位符的界线。替换之后同样
+        作废旧锚点，否则 usage 描述的是替换前的长前缀，会把占用数**高估**。
+    ★ (None, None) 与 None 产出**同一个**指纹。历史上有锚点时 view_state 恒为
+      None，若把它序列化成 [null, null]，升级这次代码会让库里所有锚点集体失效
+      一次（凭空多一次全量估算、多一次压缩）。归一化在这里做，调用方不必记得。
+    ★ 不在这里 import 别的东西：compressor 会用同一个函数算指纹，两边必须是
+      同一份实现，否则"写进去的锚点和比对时的锚点"用的不是一把尺子。
     """
-    payload = json.dumps(
-        {"system": system_prompt, "tools": tool_defs or [], "boundary": compaction_boundary},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+    # 先归一化，再拼 payload：None 和 (None, None) 都落到**旧版形状**
+    # {"system", "tools", "boundary": None}。只拼"非默认"的键，让没有触发压缩/
+    # 降级的请求与 9f69ea4 之前写进库的指纹逐字节相同 —— 升级代码不清空存量锚点。
+    state = view_state if view_state is not None else (None, None)
+    boundary, prune_before = state
+    payload_dict: dict = {"system": system_prompt, "tools": tool_defs or [], "boundary": boundary}
+    if prune_before is not None:
+        payload_dict["prune_before"] = prune_before
+    payload = json.dumps(payload_dict, ensure_ascii=False, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -149,7 +165,7 @@ def measure(
     messages: list[Message],
     system_prompt: str,
     tool_defs: Optional[list[dict]],
-    compaction_boundary: Optional[int] = None,
+    view_state: Optional[_VIEW_STATE] = None,
 ) -> TokenCount:
     """估算"把 messages 全发出去"这次请求要花多少 token。
 
@@ -168,7 +184,7 @@ def measure(
     ★ completion_tokens 也要算。 锚点那次请求产生的补全也在 transcript 里，是
       下一次请求前缀的一部分，而 prompt_tokens 描述前缀时不含它。
     """
-    fingerprint = request_fingerprint(system_prompt, tool_defs, compaction_boundary)
+    fingerprint = request_fingerprint(system_prompt, tool_defs, view_state)
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
         if msg.role != "assistant" or not _usage_is_valid(msg.usage):

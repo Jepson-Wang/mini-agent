@@ -74,13 +74,20 @@ class Settings:
     workspace: Path = DEFAULT_HOME / DEFAULT_WORKSPACE_NAME
 
     # ---- M3 上下文压缩 ----
-    # 模型的上下文上限（token）。★ 128000 是**占位值**，尚未对照 DeepSeek 文档
-    # 确认 deepseek-v4-flash 的真实上限。它只影响"提前多久压"：估小了会压得
-    # 更勤（更费一次总结调用），估大了会压得太晚。上线前必须核实。
+    # 运营预算窗口：单次请求愿意携带的上下文上限（token），必须 ≤ 模型硬上限
+    # （DeepSeek 官方 1M）。
+    # ★ 它不是"能塞多少"的物理上限，而是成本/质量取舍。128000 是刻意的默认值：
+    #   按 50% 触发，就是每次请求带约 6 万 token 才压缩；若改成 1M，就是带约 50 万
+    #   token 才压，单次调用的成本、延迟都高，而且上下文太长模型效果本身会变差。
+    #   调小只会压得更勤（每次压多花一次总结调用），调大则压得更晚。
     context_window: int = 128_000
     # 用量达到 context_window × 该比例就触发压缩。0.5 的含义是"留一半余量"：
     # 压缩本身要花一次 LLM 调用，模型也可能一次吐出很长的回答。
     compress_trigger_ratio: float = 0.5
+    # 是否启用自动压缩（两个入口共用，见 context.compressor.build_compression）。
+    # 默认开启：窗口远小于真实的 1M 上限，开着不会把窗口估大；关掉只是退回 M3 之前
+    # 的行为（上下文无限增长，直到上游 400）。MINI_AGENT_COMPRESSION=0 可关闭。
+    compression_enabled: bool = True
 
     # ---- gRPC surface（mini_agent/grpcserver）----
     grpc_port: int = 50051              # 要和 Go 那边的 AGENT_ADDR 对上
@@ -170,6 +177,35 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+# 明确表示"关"的取值（大小写不敏感）。其余任何非空值都算"开"，未设置也算"开"。
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    """读开关型环境变量：0/false/no/off → False，其余 → True。
+
+    ★ 只认这四种"关"，不认 "true"/"1" 才开。 运维手误设成 "yes "（带空格）、
+      "enabled" 时，预期是"开了"—— 而"预期开、实际关"的后果是上下文无限增长直到
+      400，没有任何提示。反过来"预期关、实际开"最多多花一次总结调用，而且用户
+      本来就是为了排查兼容性问题才关它，看到压缩日志很容易发现。
+      和 _num_env 一样打 stderr，不 import log（会成环）。
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _FALSE_VALUES:
+        return False
+    if value not in ("", "1", "true", "yes", "on"):
+        # 不认识的拼写按"开"处理，但要说出来，免得有人写了 "disable" 以为关掉了
+        print(
+            f"[config] 环境变量 {name}={raw!r} 不是明确的开关值，按开启处理"
+            f"（关闭请用 0/false/no/off）",
+            file=sys.stderr,
+        )
+    return True
+
+
 def _workspace_from_env(home: Path) -> Path:
     """沙箱根：显式给了就用，没给就挂在 home 下面。绝不退回 cwd。"""
     raw = os.getenv("MINI_AGENT_WORKSPACE")
@@ -190,6 +226,7 @@ def _load_settings() -> Settings:
         workspace=_workspace_from_env(home),
         context_window=_positive_int_env("MINI_AGENT_CONTEXT_WINDOW", 128_000),
         compress_trigger_ratio=_ratio_env("MINI_AGENT_COMPRESS_TRIGGER_RATIO", 0.5),
+        compression_enabled=_bool_env("MINI_AGENT_COMPRESSION", True),
         grpc_port=_num_env("MINI_AGENT_GRPC_PORT", 50051, int),
         grpc_max_workers=_num_env("MINI_AGENT_GRPC_MAX_WORKERS", 16, int),
         grpc_host=os.getenv("MINI_AGENT_GRPC_HOST", "127.0.0.1"),

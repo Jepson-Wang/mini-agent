@@ -5,6 +5,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 
 from pydantic import ValidationError
 
@@ -39,6 +40,36 @@ _INTERRUPTED = json.dumps(
     {"error": "interrupted: 上次运行崩溃，这个工具调用的结果未知"},
     ensure_ascii=False,
 )
+
+
+# 检查点的边界行只允许这两种 role:切在 system 后面没有意义(messages 里没有
+# system),切在 tool 上则会把一轮工具调用劈成两半 —— summary 后面直接跟一条找不到
+# assistant 的 tool 消息,之后每次请求都 400。写侧拿它拒绝、读侧拿它降级,同一个
+# 常量,两边口径不会分叉。
+_BOUNDARY_ROLES = ("user", "assistant")
+
+
+@dataclass(frozen=True)
+class LoadedContext:
+    """load_context 的结果:要发给模型的原始消息 + 它们各自的 seq + 生效的检查点。
+
+    messages 与 seqs **等长且一一对应**;seqs[i] 是 messages[i] 在 messages 表里的
+    seq,补出来的桩和(将来的)合成消息是 None —— 知道这个序号,才能把它们和库里
+    的历史对齐(测 fingerprint、选压缩边界、判断"这条是不是已经在库里")。
+
+    boundary / summary 是**生效的**检查点;两者要么都有,要么都没有(None)。
+    summary 是原文,还没渲染成消息:渲染由 context/compressor.apply_summary 负责,
+    持久化层不认识"[CONTEXT COMPACTION]"这种格式。
+
+    用 frozen:它是"历史的一个快照",谁需要改就在自己的视图里复制,不要在事实对象上
+    动手 —— 同一份快照可能被多处引用(比如算 fingerprint 时)。
+    """
+
+    messages: list[Message]
+    seqs: list[int | None]
+    boundary: int | None = None
+    summary: str | None = None
+
 
 class MiniSessionDB:
 
@@ -413,7 +444,7 @@ class MiniSessionDB:
 
     def _sanitize_dangling_tool_calls(
         self, session_id: str, rows: list[tuple[int, str, Message | None]]
-    ) -> list[Message]:
+    ) -> tuple[list[Message], list[int | None]]:
         """把每一轮 assistant(tool_calls) 补足成配对完整、可安全发给 DeepSeek 的形状。
 
         输入是 recover 读出来的 (seq, role 列, 解析后的 Message 或 None) 三元组,
@@ -454,8 +485,16 @@ class MiniSessionDB:
             就把 idx 绑定到每个 tool_call 上(record_executed_key 用的是它),并且
             tool 消息仍然**按 idx 顺序**落库 —— 否则同 id 的先进先出就不再等价于
             按位置配。
+
+        ★ 返回 (kept, seqs),seqs 与 kept 等长。 和 kept 一起产出,而不是让调用方
+          再猜一遍"哪条对应哪个 seq":补桩、认领真结果、丢弃孤儿都会改变位置,
+          在**这里**每 append 一次就同步 append 一次 seq,是对齐关系唯一的出生点。
+          补出来的桩 seq 为 None —— 它不在库里,标成真实 seq 会骗到边界校验、
+          幂等表查询这类"拿 seq 回查库"的逻辑。recover 只取 kept,行为不变;
+          load_context 要 seqs 判边界。
         """
         kept: list[Message] = []
+        seqs: list[int | None] = []
         i, n = 0, len(rows)
         while i < n:
             seq, role, msg = rows[i]
@@ -475,24 +514,30 @@ class MiniSessionDB:
 
             if msg.role != "assistant" or not msg.tool_calls:
                 kept.append(msg)  # system/user/纯文本 assistant,天然完整
+                seqs.append(seq)
                 continue
 
-            # 收集窗口:紧跟在后面、role 列为 tool 的那一段
-            queues: dict[str, deque[Message]] = defaultdict(deque)
+            # 收集窗口:紧跟在后面、role 列为 tool 的那一段。
+            # 每条队列项带上它自己的 seq,认领时和消息一起进 kept/seqs。
+            queues: dict[str, deque[tuple[Message, int]]] = defaultdict(deque)
             while i < n and rows[i][1] == "tool":
                 if rows[i][2] is not None:
-                    queues[rows[i][2].tool_call_id].append(rows[i][2])
+                    queues[rows[i][2].tool_call_id].append((rows[i][2], rows[i][0]))
                 i += 1
 
             kept.append(msg)
+            seqs.append(seq)
             for idx, tc in enumerate(msg.tool_calls):
                 q = queues.get(tc.id)
                 if q:
-                    kept.append(q.popleft())  # 真结果,原样带出
+                    real_msg, real_seq = q.popleft()
+                    kept.append(real_msg)  # 真结果,原样带出
+                    seqs.append(real_seq)  # 库里的真实行,seq 一同带出
                     continue
                 content = self._backfill_from_executed_keys(session_id, seq, idx, tc.id)
                 # 补出来的这条必须和真结果长得一模一样,否则照样 400
                 kept.append(Message(role="tool", tool_call_id=tc.id, content=content))
+                seqs.append(None)
 
             leftover = sum(len(q) for q in queues.values())
             if leftover:
@@ -501,7 +546,7 @@ class MiniSessionDB:
                     "session=%s", seq, leftover, session_id,
                 )
 
-        return kept
+        return kept, seqs
 
     def _backfill_from_executed_keys(
         self, session_id: str, assistant_seq: int, idx: int, tc_id: str
@@ -570,14 +615,31 @@ class MiniSessionDB:
         对应地,这里没有任何重试:失败的全是确定性错误,同样的输入必然同样的结果。
         重试只在"两次尝试的输入可能不同"时才有意义。锁争用那类瞬时错误由
         PRAGMA busy_timeout 在 SQLite 层兜住,不必在应用层再套一层。
+
+        实现上就是 _load_rows(全量)。对外行为与拆分前逐条一致;load_context 的
+        "无检查点 / 检查点不可用"分支读的是同一份东西,区别只是它还带回了 seqs
+        和边界信息。
         """
-        with self._db_guard(f"recover(session={session_id})"):
+        messages, _seqs = self._load_rows(session_id)
+        return messages
+
+    def _load_rows(
+        self, session_id: str, from_seq: int = 0
+    ) -> tuple[list[Message], list[int | None]]:
+        """读 [from_seq, ∞) 的消息行 → 解析 → 校验 role 列 → 补桩/配对。
+
+        返回 (messages, seqs),seqs 与 messages 等长,补出来的桩为 None。
+        recover 取 messages(全量,from_seq=0);load_context 取两者(只读检查点之后
+        那一段)。两条路径共用这里,"怎么把一行脏数据变成一条可用消息"只有一份实现
+        —— 否则读检查点的那条路会悄悄少掉 recover 这些年攒下的各种降级。
+        """
+        with self._db_guard(f"load_rows(session={session_id}, from_seq={from_seq})"):
             with self._read() as c:
                 # role 列单独取出来:坏行解析不了,但它的 role 仍然要参与窗口截断
                 db_rows = c.execute(
                     "SELECT seq, role, content FROM messages "
-                    "WHERE session_id = ? ORDER BY seq;",
-                    (session_id,),
+                    "WHERE session_id = ? AND seq >= ? ORDER BY seq;",
+                    (session_id, from_seq),
                 ).fetchall()
 
         rows: list[tuple[int, str, Message | None]] = []
@@ -607,6 +669,204 @@ class MiniSessionDB:
             rows.append((row["seq"], row["role"], msg))
 
         return self._sanitize_dangling_tool_calls(session_id, rows)
+
+    # ---------- 压缩检查点 ----------
+    #
+    # 原始 messages 只追加、不删。压缩 = 往 compactions 追加一条"把 [0, B) 折叠成
+    # summary"的事实,加载时换成"最新 summary + seq >= B 的原始行"。
+    # 快照 + 增量日志;回退不靠读路径,靠原始历史还在,可以重新压。
+
+    def append_compaction(
+        self, session_id: str, first_kept_seq: int, summary: str
+    ) -> bool:
+        """追加一条检查点。返回是否真的写入;**拒绝不是异常,是 False + 告警**。
+
+        拒绝的三种情况,对应的都是"这行检查点写了会让读路径更难办":
+          1. summary 不是 str / 去空白后为空 → 一张没有内容的摘要,等于把那段历史
+             静默抹掉。CHECK 约束也挡得住,但那会变成 IntegrityError;写侧 bug 的
+             正确结局是"这个检查点作废、本次不压",不是让整轮对话失败。
+          2. 边界行不存在,或它的 role 列是 system/tool → 读侧只能整份检查点作废。
+             tool 行意味着边界切在了某轮工具调用中间:前缀里会多出一条没有
+             assistant 的 tool 消息,每次请求 400。role 看的是**列**,和
+             _load_rows 的截断口径一致 —— 这一行在 recover 眼里是什么,这里就按什么判。
+          3. 边界不大于已有最大值 → 主键只挡"完全相等",挡不住"倒退"。倒退的
+             检查点会让 load_context 读到一段夹在旧 summary 和它边界之间的空洞。
+             用条件 INSERT 把单调性交给数据库:检查与写入是**同一条语句**,在
+             BEGIN IMMEDIATE 的写锁里,跨进程并发也不会读到过期的 MAX 再写进去
+             (两个进程同时"先查后插"就是经典的 TOCTOU)。
+        """
+        where = f"session={session_id}, first_kept_seq={first_kept_seq}"
+        if not isinstance(summary, str) or not summary.strip():
+            logger.warning("append_compaction: 拒绝写入,summary 为空或不是 str (%s)", where)
+            return False
+
+        with self._db_guard(f"append_compaction({where})"):
+            with self._write_txn() as c:
+                row = c.execute(
+                    "SELECT role FROM messages WHERE session_id = ? AND seq = ?;",
+                    (session_id, first_kept_seq),
+                ).fetchone()
+                if row is None:
+                    logger.warning("append_compaction: 拒绝写入,边界行不存在 (%s)", where)
+                    return False
+                if row["role"] not in _BOUNDARY_ROLES:
+                    logger.warning(
+                        "append_compaction: 拒绝写入,边界行 role=%s 不是 user/assistant (%s)",
+                        row["role"], where,
+                    )
+                    return False
+
+                # 两个 ? 是同一个 first_kept_seq,一个参与比较、一个落库;不允许写成
+                # 子查询以外的值,否则"比较的是 A、插入的是 B"又能绕过单调性。
+                cur = c.execute(
+                    "INSERT INTO compactions (session_id, first_kept_seq, summary, created_at) "
+                    "SELECT ?, ?, ?, ? "
+                    "WHERE ? > COALESCE("
+                    "  (SELECT MAX(first_kept_seq) FROM compactions WHERE session_id = ?), -1);",
+                    (session_id, first_kept_seq, summary, int(time.time()),
+                     first_kept_seq, session_id),
+                )
+                if cur.rowcount == 0:
+                    logger.warning(
+                        "append_compaction: 拒绝写入,边界没有大于已有检查点 (%s)", where
+                    )
+                    return False
+        return True
+
+    def latest_compaction(self, session_id: str) -> tuple[int, str] | None:
+        """最新检查点的 (first_kept_seq, summary)。
+
+        主键是 (session_id, first_kept_seq),DESC + LIMIT 1 直接走 B-tree 尾端,
+        不需要额外的索引。没有检查点返回 None。
+        """
+        with self._db_guard(f"latest_compaction(session={session_id})"):
+            with self._read() as c:
+                row = c.execute(
+                    "SELECT first_kept_seq, summary FROM compactions "
+                    "WHERE session_id = ? ORDER BY first_kept_seq DESC LIMIT 1;",
+                    (session_id,),
+                ).fetchone()
+        if row is None:
+            return None
+        return row["first_kept_seq"], row["summary"]
+
+    def last_user_content_before(self, session_id: str, seq: int) -> str | None:
+        """seq 之前（不含）最后一条 role=user 的原始 content；没有则 None。
+
+        给 LLMCompressor 用：把即将被折进摘要的那段里、用户说的最后一句话
+        **逐字**抄进摘要（压缩边界不再保证最后一条 user 留在尾部，见
+        compressor.select_boundary 的 docstring）。
+
+        ★ 按 role 列筛，不信 JSON。 与 load_context 同一口径：role 列和 JSON
+          不一致的行视为坏行。坏行 / 空 content 一律跳过，继续往前找。
+        ★ 只读、只读原始行。 不经过 load_context —— 那里可能已经带着 summary
+          前缀（那是视图，不是用户原话），而且这里只关心边界之前的部分。
+        """
+        with self._db_guard(f"last_user_content_before(session={session_id})"):
+            with self._read() as c:
+                rows = c.execute(
+                    "SELECT seq, content FROM messages "
+                    "WHERE session_id = ? AND role = 'user' AND seq < ? "
+                    "ORDER BY seq DESC;",
+                    (session_id, seq),
+                ).fetchall()
+        for row in rows:
+            try:
+                msg = Message.model_validate_json(row["content"])
+            except (ValidationError, ValueError):
+                logger.warning(
+                    "last_user_content_before: 跳过坏行 (session=%s, seq=%s)",
+                    session_id, row["seq"],
+                )
+                continue
+            if msg.role == "user" and msg.content:
+                return msg.content
+        return None
+
+    def load_context(self, session_id: str) -> LoadedContext:
+        """给 Agent 用的历史装载:有检查点就只读检查点之后那一段,附上 summary。
+
+        与 recover 共用 _load_rows + _sanitize_dangling_tool_calls,区别只有起点
+        —— 所以 recover 的每条降级规则这里自动生效(坏行跳过、悬空 tool_call 补桩、
+        按窗口配对、幂等表补回真结果)。补桩只发生在**被加载的那一段**里:边界之前
+        的悬空调用已经由 summary 代表,不需要(也不应该)再补。
+
+        ★ 读侧对检查点同样按 recover 金规则降级,绝不抛。 检查点是历史数据,可能
+          被旧版本写过、被手工改过、或者指向一行刚好坏掉的消息。任何一条不成立的
+          后果都只是"这次用不上检查点":忽略它、读全量、告警。整份检查点作废是安全
+          的 —— 原始消息一条没删,全量历史永远是对的,只是请求更长。
+          检查条件:边界行存在;它不是坏行(_load_rows 解析为 None);role 列是
+          user/assistant;summary 是 str 且去空白非空。
+        ★ 不在这里渲染 summary。 持久化层不该依赖 context 层(方向是 context →
+          persistence),summary 怎么拼进消息是 context/compressor.apply_summary 的事。
+          这里只负责"从哪读、读到什么"。
+        """
+        with self._db_guard(f"load_context(session={session_id})"):
+            with self._read() as c:
+                row = c.execute(
+                    "SELECT first_kept_seq, summary FROM compactions "
+                    "WHERE session_id = ? ORDER BY first_kept_seq DESC LIMIT 1;",
+                    (session_id,),
+                ).fetchone()
+
+            if row is None:
+                messages, seqs = self._load_rows(session_id)
+                return LoadedContext(messages=messages, seqs=seqs)
+
+            boundary, summary = row["first_kept_seq"], row["summary"]
+            reason = self._checkpoint_rejection_reason(session_id, boundary, summary)
+            if reason is not None:
+                logger.warning(
+                    "load_context: 检查点 (session=%s, first_kept_seq=%s) 不可用(%s),"
+                    "忽略它并加载全量历史",
+                    session_id, boundary, reason,
+                )
+                messages, seqs = self._load_rows(session_id)
+                return LoadedContext(messages=messages, seqs=seqs)
+
+            messages, seqs = self._load_rows(session_id, from_seq=boundary)
+            # 边界行是坏行时,_load_rows 会跳过它,tail 的第一条就成了"下一行",
+            # summary 和 tail 之间**断了一行**。检查条件里的"边界行存在、role 对"
+            # 都满足,却仍然接不上 —— 所以还要确认第一条能解析的行就是边界行本身。
+            # (seqs[0] 是补桩时为 None 的那类情况只可能出现在 tool 行,而边界行
+            #  只允许 user/assistant,所以这里直接比 seq 是安全的。)
+            if not messages or seqs[0] != boundary:
+                logger.warning(
+                    "load_context: 检查点 (session=%s, first_kept_seq=%s) 的边界行无法解析,"
+                    "忽略它并加载全量历史",
+                    session_id, boundary,
+                )
+                messages, seqs = self._load_rows(session_id)
+                return LoadedContext(messages=messages, seqs=seqs)
+        return LoadedContext(
+            messages=messages, seqs=seqs, boundary=boundary, summary=summary
+        )
+
+    def _checkpoint_rejection_reason(
+        self, session_id: str, boundary: int, summary: object
+    ) -> str | None:
+        """检查点能不能用。返回 None 表示可用,否则返回给日志看的拒绝原因。
+
+        边界行的 role 只看**列**(不看 JSON),和 _sanitize 的窗口截断同一口径:
+        列写着 tool 却解析出来是 user,要么被当坏行跳过,要么让 summary 后面直接
+        跟一条没有 assistant 的 tool 消息 —— 后者每次请求都 400。
+        """
+        if not isinstance(summary, str) or not summary.strip():
+            return "summary 为空或不是 str"
+        with self._read() as c:
+            row = c.execute(
+                "SELECT role FROM messages WHERE session_id = ? AND seq = ?;",
+                (session_id, boundary),
+            ).fetchone()
+        if row is None:
+            return "边界行不存在"
+        # ★ 这一条不是冗余。 role 列为 tool 的边界行，后面 _load_rows 也会把它当孤儿
+        #   丢掉、触发"边界行无法解析"的兜底；但 role 列与 JSON 都是 system 的行能正常
+        #   解析、seqs[0] 也等于边界，只有这里挡得住 —— 否则一条 system 消息会被当成
+        #   "第一条保留消息"，summary 插在它前面。
+        if row["role"] not in _BOUNDARY_ROLES:
+            return f"边界行 role={row['role']} 不是 user/assistant"
+        return None
 
     # ---------- 幂等表:两个方法分别用于获取 tool 结果和记录 tool 结果 ----------
     #

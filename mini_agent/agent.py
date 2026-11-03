@@ -21,7 +21,13 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
-from mini_agent.context.compressor import CompressionPolicy, Compressor
+from mini_agent.context.compressor import (
+    CompressionPolicy,
+    CompactionError,
+    Compressor,
+    apply_summary,
+    prune_old_tool_outputs,
+)
 from mini_agent.context.tokens import TokenCount, measure, request_fingerprint
 from mini_agent.llm import call_llm
 from mini_agent.log import get_logger
@@ -126,6 +132,44 @@ class _Turn:
 
     # 取消探针：返回 True 表示"别跑了"。在每个可中断的点被调用，见 _check_cancelled。
     cancel_check: Optional[Callable[[], bool]] = None
+
+    # M3：和 messages 一一对应，是每条消息在库里的 seq。合成消息（补桩、summary、
+    # 合并后的 user）是 None —— 它们不是库里的行。压缩选边界、D1 裁剪都靠它
+    # 判断"这条是不是库里的、有多旧"。
+    # ★ 默认 None 而不是 []：外部（测试、将来别的入口）可能只给 session_id +
+    #   messages 来构造 _Turn。列表默认值不能在 dataclass 里直接写 []，而在
+    #   __post_init__ 里补成 [None] * len(messages) 才能保证和 messages 等长 ——
+    #   否则 _record 往后 append 时 seqs 和 messages 错一位，后面全错。
+    seqs: Optional[list[int | None]] = None
+
+    # 生效的检查点边界（load_context 给的 first_kept_seq）。进 fingerprint。
+    boundary: Optional[int] = None
+    # D1 降级的裁剪界线：本次 run 内固定，seq < 它的旧 tool 输出已换成占位符。
+    # 也进 fingerprint —— 替换之后旧锚点的 prompt_tokens 描述的已经不是眼前的前缀。
+    prune_before: Optional[int] = None
+    # 本次 run 内总结已经失败过一次：不再重试（同一份历史、同样的输入，大概率
+    # 同样的结果，只是再白花一次调用和一轮等待）。
+    compaction_failed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.seqs is None:
+            self.seqs = [None] * len(self.messages)
+
+
+def _view_state(turn) -> Optional[tuple[int | None, int | None]]:
+    """turn 的视图状态 (boundary, prune_before)，(None, None) 归一化成 None。
+
+    ★ _measure 与 _call_model **必须**都走这一个函数。 两处各算各的（比如一处漏了
+      prune_before）就会得到两把尺子：写进去的锚点永远对不上比对时的指纹，usage
+      锚点等于不存在，每轮都退回全量估算。
+    ★ 用 getattr 而不是 turn.view_state：外部构造的鸭子类型 turn 可能没有这些
+      字段，属性不存在就等于"没有检查点、没有裁剪"。
+    """
+    boundary = getattr(turn, "boundary", None)
+    prune_before = getattr(turn, "prune_before", None)
+    if boundary is None and prune_before is None:
+        return None
+    return (boundary, prune_before)
 
 
 class Agent:
@@ -247,7 +291,13 @@ class Agent:
         见 _execute_tool_calls。其余调用方忽略返回值即可。
         """
         turn.messages.append(msg)
-        return self.db.append_message(turn.session_id, msg)
+        seq = self.db.append_message(turn.session_id, msg)
+        # seqs 必须和 messages 同步追加，否则"用 seq 判新旧"的所有上游（压缩边界、
+        # D1 裁剪、指纹）都会拿错行。append_message 抛异常时上面已 append 的
+        # messages 会多一条 —— 与 seq 错位的风险同源，但这是 fail-fast 路径：
+        # 异常会一路抛到调用方，这一轮不会再往下用 turn。
+        turn.seqs.append(seq)
+        return seq
 
     def _tool_defs(self) -> Optional[list[dict]]:
         """本轮要暴露给模型的工具列表。无 toolset → None（等价 M0，不带工具）。"""
@@ -264,8 +314,9 @@ class Agent:
           是上下文最长、最需要数准的那一轮）。
 
         ★ fingerprint 和 usage 在这里**一起**写：它描述的是"这次请求的前缀"
-          （system + 本轮 tools + 压缩边界），只有发请求的这一处同时知道这三样。
+          （system + 本轮 tools + 视图状态），只有发请求的这一处同时知道这三样。
           收尾调用 tools=None，指纹天然不同，下一轮 measure 会跳过这个锚点。
+          视图状态取自 turn.view_state，和 _measure 是同一个属性 —— 见它的说明。
         """
         api_msgs = [self.system_dict] + [m.to_openai() for m in turn.messages]
         reply = call_llm(api_msgs, tools=tools)
@@ -277,7 +328,9 @@ class Agent:
                 msg.usage = TokenUsage(
                     prompt_tokens=reply.usage.prompt_tokens,
                     completion_tokens=reply.usage.completion_tokens,
-                    fingerprint=request_fingerprint(self.system_prompt, tools),
+                    fingerprint=request_fingerprint(
+                        self.system_prompt, tools, _view_state(turn)
+                    ),
                 )
             except Exception:
                 # 最后一道闸：usage 是纯遥测，构造失败只意味着"这条没有锚点"，
@@ -301,8 +354,25 @@ class Agent:
         ★ 压完还超阈值只告警、不重试。 再压一次是纯浪费（同一份历史、同样的输入、
           大概率同样的结果），真要死循环也是在这里。真正超限的处理交给后续的
           "400 被动兜底"。
+
+        三条路径：
+          - 成功：按新检查点重新 load_context + apply_summary 替换 turn 的视图。
+            压缩器**只落检查点、不改内存**，不重载的话 compress 等于没发生，请求
+            原样发出（plan 2.2 的 TODO）。boundary 随之更新，指纹换一把，旧锚点
+            整批作废，下一次计数退回估算。
+          - CompactionError：本次 run 不再尝试（compaction_failed），并做 D1 降级
+            —— 把候选边界之前的旧工具输出换成占位符，替换点固定为 e.boundary，
+            本次 run 内不再移动。只改内存视图，库里一字不动。
+          - TaskCancelled：**原样上抛**。它虽然是 Exception 子类，但代表的是"用户
+            不要了"，不是"压缩失败了"；吞掉的话封口逻辑（_seal_cancelled_turn）和
+            调用方都看不到取消，gRPC 的 CancelTask 会变成一个跑完的任务。
+          - 其它异常：同样视为失败，但没有可信的候选边界，不做裁剪。
         """
         if self.compressor is None or self.policy is None:
+            return
+        if turn.compaction_failed:
+            # 本次 run 已经失败过：同一份历史、同样的输入，再试只是再花一次调用。
+            # 降级（如果有）已经作用在 turn.messages 上，照常发请求即可。
             return
         try:
             count = self._measure(turn, tools)
@@ -312,21 +382,52 @@ class Agent:
             return
         if not self.policy.should_compress(count):
             return
+        self._emit(turn, "compacting", json.dumps(
+            {"tokens": count.tokens, "source": count.source}, ensure_ascii=False,
+        ))
+        latest_before = self.db.latest_compaction(turn.session_id)
         try:
             self.compressor.compress(turn)
+        except TaskCancelled:
+            # ★ 必须排在 except Exception 前面：TaskCancelled 是 Exception 子类。
+            raise
+        except CompactionError as e:
+            self._degrade_after_compaction_failure(turn, e.boundary, count)
+            return
         except Exception:
             logger.exception(
-                "压缩器抛异常，已忽略并继续发请求 session=%s tokens=%s source=%s",
+                "压缩器抛异常，本次 run 不再尝试压缩 session=%s tokens=%s source=%s",
                 turn.session_id, count.tokens, count.source,
             )
+            turn.compaction_failed = True
+            self._emit(turn, "compacted", json.dumps(
+                {"ok": False, "reason": "error"}, ensure_ascii=False,
+            ))
             return
-        # TODO[M3 下一块] 压缩之后还缺两步，缺了真实 compressor 一接上就会现形：
-        #   1) 按最新检查点从库里**重新加载** turn.messages（Compressor 的契约是
-        #      只落检查点，不改内存；不重载则 compress 等于没发生，请求原样发出）；
-        #   2) _measure 与 _call_model 传入**同一个**最新检查点的 first_kept_seq
-        #      作为 compaction_boundary（现在恒为 None，压缩前后的指纹一样，旧锚点
-        #      不会失效 —— 而压过的历史已经变了，旧 prompt_tokens 不再描述它）。
-        #   不做这两步时，"压完仍超阈值"会每次必响、且请求并不会变短。
+        # ★ 判定"有没有落新检查点"看的是**压缩前后**最新检查点变没变，不是拿它和
+        #   turn.boundary 比：库里的检查点可能被 load_context 降级忽略了（turn.boundary
+        #   为 None、latest 却不是），那样一次 noop 会被误判成成功、给 Go 发
+        #   compacted{ok: true, boundary: null}。
+        latest = self.db.latest_compaction(turn.session_id)
+        if latest is None or latest == latest_before:
+            # ★ 压缩器**没有**落新检查点（select_boundary 返回 None：中段 < 2k /
+            #   装得下尾部）≠"压缩生效"。旧代码照常重载、记 "压缩生效 boundary=None"、
+            #   发 ok:true，订阅方会以为上下文已被折叠。这里如实报 ok:false + noop。
+            #   ★ 不设 compaction_failed：下一轮历史又长了一点，可能就够压了。
+            logger.info(
+                "本轮未产生检查点，跳过压缩（noop）session=%s tokens=%s source=%s",
+                turn.session_id, count.tokens, count.source,
+            )
+            self._emit(turn, "compacted", json.dumps(
+                {"ok": False, "reason": "noop"}, ensure_ascii=False,
+            ))
+            return
+        self._reload_after_compaction(turn)
+        self._emit(turn, "compacted", json.dumps(
+            {"ok": True, "boundary": turn.boundary}, ensure_ascii=False,
+        ))
+        # 压缩后复核：压完仍超阈值说明这次压得不够（尾部边界 + 保留量本身就超标）。
+        # 不重试，只告警 —— 再压一次是同一份历史、同样的输入，大概率同样的结果。
         try:
             after = self._measure(turn, tools)
         except Exception:
@@ -340,13 +441,63 @@ class Agent:
                 turn.session_id,
             )
 
+    def _reload_after_compaction(self, turn: _Turn) -> None:
+        """压缩成功：按最新检查点从库里重建 turn 的视图（messages / seqs / boundary）。
+
+        ★ 不能直接改 turn.messages 里的内容。 压缩的正确语义是"库里多了一条检查点"，
+          视图是它的投影。从库里读回来，视图和库就不可能分叉；自己拼一份"少了几条"
+          的列表，一旦和 load_context 的渲染规则（summary 合并、补桩、配对）差一点，
+          表现就是请求 400。
+        ★ prune_before 清空：检查点生效后，旧工具输出本来就不在视图里了；残留的
+          裁剪点只会让指纹多带一个无意义的维度。
+        """
+        ctx = self.db.load_context(turn.session_id)
+        messages, seqs = apply_summary(ctx.messages, ctx.seqs, ctx.summary)
+        turn.messages = messages
+        turn.seqs = seqs
+        turn.boundary = ctx.boundary
+        turn.prune_before = None
+        logger.info(
+            "压缩生效 session=%s boundary=%s messages=%s",
+            turn.session_id, turn.boundary, len(turn.messages),
+        )
+
+    def _degrade_after_compaction_failure(
+        self, turn: _Turn, boundary: Optional[int], count: TokenCount
+    ) -> None:
+        """总结失败的降级（D1）：把候选边界之前的旧工具输出换成占位符。
+
+        ★ 只改内存视图。 库里的原始消息一条不动 —— append-only、审计、
+          exactly-once 都建立在原始数据之上；而且 Agent 是无状态的，下一次
+          run_conversation 会重新 load_context，自然拿到完整原文并重新尝试总结。
+        ★ 替换点固定为这次选出的边界，不随对话增长往后移。 前缀只在替换发生的那一刻
+          变一次，之后每轮的请求前缀都相同，缓存才有机会命中。
+        ★ prune_before 进视图状态 → 进指纹。 替换之后旧锚点的 prompt_tokens 描述的
+          是替换前的长前缀，必须作废，计数退回估算。
+        ★ e.boundary 为 None 时没有可信的裁剪界线，只禁用本次 run 的重试。
+        """
+        turn.compaction_failed = True
+        if boundary is not None:
+            turn.messages = prune_old_tool_outputs(turn.messages, turn.seqs, boundary)
+            turn.prune_before = boundary
+        logger.warning(
+            "总结失败，本次 run 不再尝试压缩 session=%s tokens=%s source=%s prune_before=%s",
+            turn.session_id, count.tokens, count.source, turn.prune_before,
+        )
+        self._emit(turn, "compacted", json.dumps(
+            {"ok": False, "prune_before": turn.prune_before}, ensure_ascii=False,
+        ))
+
     def _measure(self, turn: _Turn, tools: Optional[list[dict]]) -> TokenCount:
         """当前 turn.messages 发出去的上下文占用估算。见 context.tokens.measure。
 
-        compaction_boundary 恒为 None：检查点的读取（recover 按检查点加载）还没做，
-        等它落地后从这里传入最新检查点的 first_kept_seq，旧锚点会自动整批失效。
+        视图状态和 _call_model 写进 usage 的指纹**来自同一个 turn.view_state**：
+        检查点边界 + D1 裁剪点，任一变化都让旧锚点作废。
+        ★ 用 _view_state(turn) 而不是 turn.view_state 属性：测试/其它入口会拿
+          鸭子类型的假 turn（只有 session_id + messages）直接调 _measure。
+          属性不存在 = 没有检查点也没有裁剪，视图状态就是 None。
         """
-        return measure(turn.messages, self.system_prompt, tools, compaction_boundary=None)
+        return measure(turn.messages, self.system_prompt, tools, view_state=_view_state(turn))
 
     def _execute_tool_calls(
         self, turn: _Turn, assistant: Message, assistant_seq: int
@@ -446,7 +597,8 @@ class Agent:
         起手三步：
           1. ensure_session —— 幂等补上 sessions 行。Go 那边"有"这个 session 不等于
              我们库里有，而 messages 有外键指向 sessions，不补首次 append 必炸。
-          2. recover —— 历史的唯一真相在库里。它顺带把上次崩溃留下的残缺轮补桩、
+          2. load_context —— 历史的唯一真相在库里；有压缩检查点时只读边界之后的
+             那一段，summary 由 apply_summary 渲染进视图（M3）。它顺带把上次崩溃留下的残缺轮补桩、
              并从幂等表回填已执行工具的真结果，所以"上次跑到一半挂了"在每轮开头
              就被免费处理掉了。新 session 返回 []，于是新建/续跑两条路合并成一条。
           3. 记下用户这句话 —— 除非上一回合没跑完（见 _turn_in_flight）。那说明
@@ -459,15 +611,23 @@ class Agent:
         逼模型用文本作答，而不是无限调工具。
         """
         self.db.ensure_session(session_id)
-        history = self.db.recover(session_id)
+        # ★ 用 load_context 而不是 recover：有检查点时只读边界之后那一段，并把
+        #   summary 渲染进视图（apply_summary）。recover 仍然读全量，它是崩溃恢复
+        #   的真相来源，两者共用 _load_rows，降级规则一致。
+        #   _turn_in_flight 看的是**渲染前**的 ctx.messages：判据关心的只是末尾
+        #   那条是什么，summary 在开头，不影响结论。
+        ctx = self.db.load_context(session_id)
+        messages, seqs = apply_summary(ctx.messages, ctx.seqs, ctx.summary)
         turn = _Turn(
             session_id=session_id,
-            messages=history,
+            messages=messages,
+            seqs=seqs,
+            boundary=ctx.boundary,
             on_event=on_event,
             cancel_check=cancel_check,
         )
 
-        if not _turn_in_flight(history):
+        if not _turn_in_flight(ctx.messages):
             self._record(turn, Message(role="user", content=user_message))
 
         try:

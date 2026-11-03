@@ -19,6 +19,7 @@ import sys
 
 from mini_agent.agent import Agent
 from mini_agent.config import DEFAULT_TOOLSET, settings
+from mini_agent.context.compressor import build_compression
 from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
 
 
@@ -92,7 +93,14 @@ def main() -> None:
         print(f"会话 {session_id}")
 
     # 无状态 agent：不绑 session，构造一次、整个 REPL 复用。
-    agent = Agent(db=db, toolset=DEFAULT_TOOLSET, max_turns=settings.max_turns)
+    # 压缩的装配走 build_compression（和 gRPC 同一份，两个 surface 不能互相 import）；
+    # MINI_AGENT_COMPRESSION=0 时它返回 {}，Agent 就完全不检查上下文用量。
+    agent = Agent(
+        db=db,
+        toolset=DEFAULT_TOOLSET,
+        max_turns=settings.max_turns,
+        **build_compression(db),
+    )
 
     print(f"mini-agent ({settings.model}) — 输入 'exit' 退出；"
           f"下次可用 --resume {session_id} 继续")

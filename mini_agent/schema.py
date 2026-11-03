@@ -37,7 +37,7 @@ class TokenUsage(BaseModel):
       ★ "不存在"的范围只限 usage 自己，不外溢到整条消息：usage 坏掉的结局由
       Message 的 wrap 校验兜成 None，见 Message.usage。
 
-    fingerprint 记录的是"这个数字描述的是哪种请求前缀"（system + tools + 压缩边界），
+    fingerprint 记录的是"这个数字描述的是哪种请求前缀"（system + tools + 视图状态），
     见 context/tokens.py :: request_fingerprint。前缀一变它就作废，measure 会把这条 usage
     当不存在、退回估算。
     """

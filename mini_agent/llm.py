@@ -89,19 +89,33 @@ def _extract_usage(resp: Any) -> RawUsage | None:
     return RawUsage(prompt_tokens=prompt, completion_tokens=completion)
 
 
-def call_llm(messages: list[dict[str, Any]], tools: list[dict] | None = None) -> LLMReply:
+def call_llm(
+    messages: list[dict[str, Any]],
+    tools: list[dict] | None = None,
+    *,
+    max_tokens: int | None = None,
+) -> LLMReply:
     """发一次 DeepSeek 调用，返回 LLMReply(message, usage)。
 
     messages 已是 OpenAI 风格 dict；DeepSeek 直接吃，无需转换。
     reply.message 含 .content 与 .tool_calls（供 Message.from_openai 消费）。
 
+    ★ max_tokens=None 时**不传**这个参数，而不是传 None 或 0。 主对话走 SDK
+      默认（模型能吐多少吐多少）；只有压缩总结才设上限。把 None 原样塞进请求体，
+      SDK 会把它序列化成 null，上游对 null 和在不在是两回事 —— 主对话的行为不该
+      因为加了"可选参数"而变。
+
     超时由客户端层统一兜底（见 _get_client 的 timeout=settings.request_timeout），
     覆盖每一次调用，这里不必逐次穿参。将来若某一炮需要不同超时，再加
     关键字可选参数 `*, timeout=None` 覆盖即可。
     """
+    extra: dict[str, Any] = {}
+    if max_tokens is not None:
+        extra["max_tokens"] = max_tokens
     resp = _get_client().chat.completions.create(
         model=settings.model,
         messages=messages,
         tools=tools or None,   # 为空时传 None，不要传 []
+        **extra,
     )
     return LLMReply(message=resp.choices[0].message, usage=_extract_usage(resp))

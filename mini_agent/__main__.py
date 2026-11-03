@@ -20,7 +20,10 @@ import sys
 from mini_agent.agent import Agent
 from mini_agent.config import DEFAULT_TOOLSET, settings
 from mini_agent.context.compressor import build_compression
+from mini_agent.log import get_logger
 from mini_agent.persistence.session_db import MiniSessionDB, PersistenceError
+
+logger = get_logger(__name__)
 
 
 def _parse_resume(argv: list[str]) -> str | None:
@@ -116,7 +119,28 @@ def main() -> None:
                 break
             if not user.strip():
                 continue
-            out = agent.run_conversation(session_id, user)
+
+            try:
+                out = agent.run_conversation(session_id, user)
+            except KeyboardInterrupt:
+                # 跑到一半按 Ctrl-C：当作「我不想等了，结束会话」，走正常收尾
+                # （finally 里的 end_session），而不是甩用户一坨 traceback。
+                print()
+                break
+            except Exception as e:
+                # ★ 一轮对话失败不该结束整个 REPL。网络抖动、429、某个工具漏出
+                #   dispatch 兜底的异常都是**单轮**的问题；异常冲出 while 就会把用户
+                #   连人带会话踢出去。就地报错、留在 REPL 里。
+                #   已知限制：用户那句话已落库而这一轮没跑完，若下一句是**不同**的话，
+                #   仍可能被 _turn_in_flight 当成重试而不记录 —— 所以提示里写「原样
+                #   重发」。这个修复缩小了问题，没有消除它。
+                logger.exception("run_conversation 失败 session=%s", session_id)
+                print(f"这一轮出错了：{type(e).__name__}: {e}\n"
+                      f"（你刚才那句话已经落库；**原样重发一遍**即可从断点续跑，"
+                      f"详情见日志）",
+                      file=sys.stderr)
+                continue
+
             print(out["final_response"])
     finally:
         # 正常退出 / Ctrl-C / 异常都走这里，把会话标记成结束

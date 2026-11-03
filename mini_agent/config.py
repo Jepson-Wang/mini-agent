@@ -65,7 +65,12 @@ class Settings:
     # 注意它只挡 repr，不挡 asdict()/序列化 —— 真要往外发之前还是得自己想清楚。
     deepseek_api_key: str = field(repr=False)
     base_url: str = DEEPSEEK_BASE_URL
-    model: str = "deepseek-v4-flash"    # deepseek-chat 已下线，flash 为新命名下最接近的通用档位
+    # 默认 deepseek-flash（官方定价页现行名，DeepSeek-V4.1-Flash）。旧别名
+    # deepseek-v4-flash 已被官方列为退役别名：仍可调用、由 deepseek-flash 承接，
+    # 所以通过 MINI_AGENT_MODEL 指定旧名的部署不会坏。
+    # ★ 换模型名不影响已存的 usage 锚点：request_fingerprint 只哈希
+    #   {system, tools, view_state}，不含模型名，历史锚点照常有效。
+    model: str = "deepseek-flash"
     max_turns: int = 25                 # IterationBudget 默认上限（主 agent）
     request_timeout: float = 120.0      # 单次 LLM 调用超时（秒）；SDK 默认 600s 太长
     home: Path = DEFAULT_HOME           # 运行时状态根目录，见上
@@ -219,7 +224,7 @@ def _load_settings() -> Settings:
     return Settings(
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
         base_url=os.getenv("MINI_AGENT_BASE_URL", DEEPSEEK_BASE_URL),
-        model=os.getenv("MINI_AGENT_MODEL", "deepseek-v4-flash"),
+        model=os.getenv("MINI_AGENT_MODEL", "deepseek-flash"),  # 迁移说明见 Settings.model
         max_turns=_num_env("MINI_AGENT_MAX_TURNS", 25, int),
         request_timeout=_num_env("MINI_AGENT_REQUEST_TIMEOUT", 120.0, float),
         home=home,

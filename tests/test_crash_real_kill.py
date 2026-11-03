@@ -56,7 +56,15 @@ def _spawn(mode: str, db_path: Path, sentinel: Path, log: Path) -> subprocess.Po
       这里做的事和 pyproject 给 pytest 配 `pythonpath = ["."]` 完全等价：把项目根
       喂给子进程，让测试自带环境、不依赖装没装。
     """
-    env = {**os.environ, "PYTHONPATH": _PROJECT_ROOT}
+    # 前插而不是覆盖：调用方（CI、开发者）可能已经靠 PYTHONPATH 提供了别的依赖
+    # 路径，直接覆盖会把它们丢掉；放在最前面则保证 worktree/本仓库的代码优先于
+    # 任何已安装的 editable 副本被 import。原值为空时只用项目根，避免拼出尾随分隔符
+    # （空项会被解释成 cwd）。
+    prev = os.environ.get("PYTHONPATH", "")
+    env = {
+        **os.environ,
+        "PYTHONPATH": _PROJECT_ROOT + os.pathsep + prev if prev else _PROJECT_ROOT,
+    }
     return subprocess.Popen(
         [sys.executable, _VICTIM, mode, str(db_path), str(sentinel)],
         cwd=_PROJECT_ROOT,

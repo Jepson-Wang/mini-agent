@@ -9,6 +9,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from dotenv import load_dotenv
 
@@ -93,6 +94,14 @@ class Settings:
     # 默认开启：窗口远小于真实的 1M 上限，开着不会把窗口估大；关掉只是退回 M3 之前
     # 的行为（上下文无限增长，直到上游 400）。MINI_AGENT_COMPRESSION=0 可关闭。
     compression_enabled: bool = True
+    # 单次工具输出的 token 上限，超了由运行时截断（见 Agent.max_tool_output_tokens）。
+    # 默认 context_window // 10：压缩的尾部预算是窗口的 15% 量级，取 10% 才能保证
+    # "最新一轮的单个工具输出"放得进尾部 —— 否则压缩永远压不动它，重试照样 400。
+    # 只限单次调用，一轮内多个并发 tool_call 的总量不在范围内。
+    # ★ 默认是 None、在 __post_init__ 里按 context_window 推出来，而不是写死 12800：
+    #   直接构造 Settings(context_window=50_000) 的代码（测试、将来别的入口）若拿到
+    #   写死的 12800，上限就比窗口的 10% 大一倍多，"放得进尾部"的保证悄悄失效。
+    tool_output_max_tokens: Optional[int] = None
 
     # ---- gRPC surface（mini_agent/grpcserver）----
     grpc_port: int = 50051              # 要和 Go 那边的 AGENT_ADDR 对上
@@ -113,6 +122,13 @@ class Settings:
     # 一旦往外绑就必须有。这个取向和 Go 的 AGENT_CALLBACK_SECRET 一致——
     # 密钥缺失时宁可拒绝服务，也不要"能跑但没防护"。
     grpc_token: str = field(default="", repr=False)
+
+    def __post_init__(self) -> None:
+        # frozen dataclass 只能用 object.__setattr__ 补派生默认值
+        if self.tool_output_max_tokens is None:
+            object.__setattr__(
+                self, "tool_output_max_tokens", max(1, self.context_window // 10)
+            )
 
     def workspace_path(self) -> Path:
         """沙箱根目录（会建出来）。别直接用它——用模块级的 workspace_root()。"""
@@ -221,6 +237,8 @@ def _workspace_from_env(home: Path) -> Path:
 
 def _load_settings() -> Settings:
     home = Path(os.getenv("MINI_AGENT_HOME", DEFAULT_HOME)).expanduser()
+    # 先算出 context_window，工具输出上限的默认值要跟着它走
+    context_window = _positive_int_env("MINI_AGENT_CONTEXT_WINDOW", 128_000)
     return Settings(
         deepseek_api_key=os.getenv("DEEPSEEK_API_KEY", ""),
         base_url=os.getenv("MINI_AGENT_BASE_URL", DEEPSEEK_BASE_URL),
@@ -229,9 +247,13 @@ def _load_settings() -> Settings:
         request_timeout=_num_env("MINI_AGENT_REQUEST_TIMEOUT", 120.0, float),
         home=home,
         workspace=_workspace_from_env(home),
-        context_window=_positive_int_env("MINI_AGENT_CONTEXT_WINDOW", 128_000),
+        context_window=context_window,
         compress_trigger_ratio=_ratio_env("MINI_AGENT_COMPRESS_TRIGGER_RATIO", 0.5),
         compression_enabled=_bool_env("MINI_AGENT_COMPRESSION", True),
+        # max(1, …)：窗口极小（<10）时 //10 为 0，会被当成非法值
+        tool_output_max_tokens=_positive_int_env(
+            "MINI_AGENT_TOOL_OUTPUT_MAX_TOKENS", max(1, context_window // 10)
+        ),
         grpc_port=_num_env("MINI_AGENT_GRPC_PORT", 50051, int),
         grpc_max_workers=_num_env("MINI_AGENT_GRPC_MAX_WORKERS", 16, int),
         grpc_host=os.getenv("MINI_AGENT_GRPC_HOST", "127.0.0.1"),

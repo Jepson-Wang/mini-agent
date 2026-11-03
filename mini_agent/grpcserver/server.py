@@ -723,6 +723,7 @@ def serve(
         db=db,
         toolset=DEFAULT_TOOLSET,
         max_turns=settings.max_turns,
+        max_tool_output_tokens=settings.tool_output_max_tokens,
         **build_compression(db),
     )
     servicer = AgentServicer(agent)

@@ -28,7 +28,13 @@ from mini_agent.context.compressor import (
     apply_summary,
     prune_old_tool_outputs,
 )
-from mini_agent.context.tokens import TokenCount, measure, request_fingerprint
+from mini_agent.context.tokens import (
+    TokenCount,
+    estimate_text,
+    measure,
+    request_fingerprint,
+    truncate_tool_output,
+)
 from mini_agent.llm import call_llm, is_context_overflow
 from mini_agent.log import get_logger
 from mini_agent.schema import Message, TokenUsage
@@ -187,6 +193,7 @@ class Agent:
         max_turns: int = 25,
         compressor: Optional[Compressor] = None,
         policy: Optional[CompressionPolicy] = None,
+        max_tool_output_tokens: Optional[int] = None,
     ):
         # db 是**必需**依赖，不再允许 None。会话历史的唯一真相在库里，没有 db
         # 就没有历史可言；而 sessions 表里的 parent_session_id/depth 说明连将来的
@@ -204,6 +211,13 @@ class Agent:
         # 等 compressor 的真实实现落地、两个入口各自决定接不接。
         self.compressor = compressor
         self.policy = policy
+
+        # 单次工具输出的 token 上限（None = 不截断）。独立于 compressor/policy：
+        # 压缩永远不压"最新一轮"（模型还没读过刚返回的结果），单次输出本身超预算时
+        # 压缩帮不上忙、重试照样 400 —— 所以这是压缩关掉也要在的安全网。
+        # ★ 已知限制：只限**单次调用**。一轮里多个 tool_call 的总量不在此处管，
+        #   剩余风险由 400 被动兜底 + 旧工具输出裁剪承担。
+        self.max_tool_output_tokens = max_tool_output_tokens
 
         if toolset:
             # 显式、幂等地做一次工具发现：一个"带工具的 agent"就该保证工具已注册。
@@ -614,6 +628,20 @@ class Agent:
                 ensure_ascii=False,
             ))
             result = registry.dispatch(tc.name, tc.arguments)
+            # ★ 截断必须在 record_executed_key **之前**：幂等表里的 result 和
+            #   transcript 里的 tool 消息得是同一份。崩在两次写之间时 recover 从幂等
+            #   表补回的就是模型本来会看到的那份；若先记全文再截断，补回来的是未截断
+            #   全文，同一次调用就有两种答案（还可能一补回来就把上下文撑爆）。
+            if self.max_tool_output_tokens is not None:
+                truncated = truncate_tool_output(result, self.max_tool_output_tokens)
+                if truncated is not result:
+                    # 只记长度和工具名，不记内容（可能含文件/网页里的敏感信息）
+                    logger.info(
+                        "工具输出超限已截断 tool=%s 原长=%d字符/约%dtoken 截后=%d字符 上限=%dtoken",
+                        tc.name, len(result), estimate_text(result),
+                        len(truncated), self.max_tool_output_tokens,
+                    )
+                    result = truncated
             is_first, canonical = self.db.record_executed_key(
                 turn.session_id, assistant_seq, idx, tc.id, {"content": result}
             )

@@ -77,6 +77,60 @@ def estimate_text(text: str) -> int:
     return math.ceil(cjk * _CJK_TOKENS_PER_CHAR + (len(text) - cjk) * _OTHER_TOKENS_PER_CHAR)
 
 
+# 截断时头:尾的字符配比。开头通常带"这是什么"（文件头、导入、标题），结尾带
+# "结果如何"（报错栈、汇总行），两头都比中间值钱；头多给一点是因为开头决定模型
+# 能不能看懂后面。
+_TRUNCATE_HEAD_RATIO = 0.75
+
+# 预算连完整标记都放不下时的退路。已经是能表达"被截断了"的最短形态。
+_MIN_MARKER = "…[截断]…"
+
+
+def truncate_tool_output(text: str, max_tokens: int) -> str:
+    """把单次工具输出压到 estimate_text(结果) <= max_tokens；不超限则原样返回**同一对象**。
+
+    超限时保留开头约 75%、结尾约 25% 的字符，中间换成一行说明原长度的标记。
+
+    ★ 用二分而不是"max_tokens / 0.3 个字符"这类近似：中文是 0.6 token/字符，
+      按 0.3 反推字符数会让纯中文结果超预算整整一倍 —— 而这个函数的全部意义就是
+      "截完一定放得下"。estimate_text 对 (head, tail) 同时增长是单调的（多一个字符
+      只会多不会少），所以能二分"保留字符总数 k"，标记本身的开销一并计入。
+
+    ★ 确定性：结果只由 (text, max_tokens) 决定，不读时间/随机数/环境。它会被写进
+      幂等表和 transcript，并成为之后每次请求的前缀 —— 同一输入两次得到不同字节，
+      会让前缀缓存失效，也会让崩溃恢复补回的内容和当初模型看到的对不上。
+
+    ★ 兜底语义（尽力而为，不抛异常）：max_tokens 小到完整标记都放不下时退到最短
+      标记 _MIN_MARKER；若连它都超（max_tokens 个位数），也照样返回它 —— 此时
+      "放得下"已不可能，给模型一个明确的"被截断"信号比返回空串好。
+    """
+    if estimate_text(text) <= max_tokens:
+        return text
+
+    n_chars = len(text)
+    marker = (
+        f"\n…[运行时截断：原输出 {n_chars} 字符，约 {estimate_text(text)} token，"
+        f"超过单次上限 {max_tokens} token；中间部分已省略，以下为结尾部分]…\n"
+    )
+
+    def build(k: int) -> str:
+        head = int(k * _TRUNCATE_HEAD_RATIO)
+        tail = k - head
+        # tail == 0 时不能写 text[-0:]（那是整串）
+        return text[:head] + marker + (text[n_chars - tail:] if tail else "")
+
+    if estimate_text(marker) > max_tokens:
+        return _MIN_MARKER
+    lo, hi = 0, n_chars          # 不变式：build(lo) 放得下
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate_text(build(mid)) <= max_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return build(lo)
+
+
 def estimate_message(msg: Message) -> int:
     """一条消息的估算：正文 + tool_calls（name + 参数 JSON）+ 结构开销。"""
     tokens = _PER_MESSAGE_OVERHEAD

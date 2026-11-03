@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import openai
 from openai import OpenAI
 
 from mini_agent.config import settings
@@ -87,6 +88,49 @@ def _extract_usage(resp: Any) -> RawUsage | None:
         logger.warning("上游 usage 字段不是整数，按无 usage 处理：%r", usage)
         return None
     return RawUsage(prompt_tokens=prompt, completion_tokens=completion)
+
+
+# 上下文超长的判据。DeepSeek 官方文档没写这个错误的格式，下面两条来自第三方报告：
+# HTTP 400 / invalid_request_error，message 形如 "This model's maximum context
+# length is N tokens. However, you requested M tokens ..."；而 `code` 字段**不稳定**，
+# 有时是 "context_length_exceeded"，有时只是 "invalid_request_error"。所以 code 和
+# message 任一命中即可；另有托管商对"prompt + max_tokens 超窗口"返回 422，一并认。
+_OVERFLOW_CODE = "context_length_exceeded"
+_OVERFLOW_PHRASE = "maximum context length"
+
+
+def is_context_overflow(exc: BaseException) -> bool:
+    """这个异常是不是"请求超过模型上下文窗口"。**永不抛异常。**
+
+    ★ 识别必须窄。 误判的代价是白花一次总结调用、压完原样再 400；一个普通的格式
+      错误 400（比如 "Invalid request body format"）绝不能触发压缩。所以先卡类型
+      （只认 400 / 422 两个子类，401/429/5xx 和非 openai 异常一律不认），再卡
+      code 或 message 的特征，缺一不可。
+    ★ SDK 细节只留在这里：llm.py 是唯一碰网络的地方，agent 只拿一个布尔值，
+      不必认识 openai 的异常层级。
+    ★ 全程防御性取值：这是在**错误处理路径**上跑的代码，它自己再抛异常会把原始
+      错误盖掉。取不到的字段一律当"没有"。
+    """
+    try:
+        if not isinstance(exc, (openai.BadRequestError, openai.UnprocessableEntityError)):
+            return False
+        code = getattr(exc, "code", None)
+        message = getattr(exc, "message", None)
+        body = getattr(exc, "body", None)
+        # body 可能是 {"error": {...}}（原始响应体），也可能已经是内层 {...}
+        if isinstance(body, dict):
+            inner = body.get("error")
+            if isinstance(inner, dict):
+                body = inner
+            if code is None:
+                code = body.get("code")
+            if not isinstance(message, str):
+                message = body.get("message")
+        if isinstance(code, str) and code == _OVERFLOW_CODE:
+            return True
+        return isinstance(message, str) and _OVERFLOW_PHRASE in message.lower()
+    except Exception:
+        return False
 
 
 def call_llm(

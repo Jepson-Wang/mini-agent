@@ -29,7 +29,7 @@ from mini_agent.context.compressor import (
     prune_old_tool_outputs,
 )
 from mini_agent.context.tokens import TokenCount, measure, request_fingerprint
-from mini_agent.llm import call_llm
+from mini_agent.llm import call_llm, is_context_overflow
 from mini_agent.log import get_logger
 from mini_agent.schema import Message, TokenUsage
 from mini_agent.tools.registry import registry, discover_builtin_tools
@@ -317,9 +317,39 @@ class Agent:
           （system + 本轮 tools + 视图状态），只有发请求的这一处同时知道这三样。
           收尾调用 tools=None，指纹天然不同，下一轮 measure 会跳过这个锚点。
           视图状态取自 turn.view_state，和 _measure 是同一个属性 —— 见它的说明。
+
+        ★ 上下文超长的 400 是这里的被动兜底：计数是估算 + 锚点，偏低一点就会在阈值
+          之下照样撞墙，而撞墙时唯一的出路是压缩。所以收到 is_context_overflow 的
+          异常后**强制压缩一次**（越过阈值和 compaction_failed 的闸），**只有视图真的
+          变了**才重建请求、重试**一次**：
+          - 视图没变（没东西可压、也没东西可裁）→ 原样请求必然再 400，直接抛原异常；
+          - 重试再超长 → 直接抛，绝不第三次（压缩已经尽力，再来只是死循环）；
+          - 没有 compressor/policy → 没有可用的补救手段，原样抛。
+          预算耗尽的收尾调用（tools=None）同样走这里，自动覆盖。
+          重试后的 fingerprint 照常取当时的 _view_state(turn)，锚点描述的是真正发出去的前缀。
         """
         api_msgs = [self.system_dict] + [m.to_openai() for m in turn.messages]
-        reply = call_llm(api_msgs, tools=tools)
+        try:
+            reply = call_llm(api_msgs, tools=tools)
+        except Exception as e:
+            if (
+                not is_context_overflow(e)
+                or self.compressor is None
+                or self.policy is None
+            ):
+                raise
+            logger.warning(
+                "上游报告上下文超长，强制压缩后重试一次 session=%s", turn.session_id,
+            )
+            before = self._view_snapshot(turn)
+            self._maybe_compress(turn, tools, force=True)   # TaskCancelled 原样上抛
+            if self._view_snapshot(turn) == before:
+                logger.warning(
+                    "强制压缩没有改变视图，不重试 session=%s", turn.session_id,
+                )
+                raise
+            api_msgs = [self.system_dict] + [m.to_openai() for m in turn.messages]
+            reply = call_llm(api_msgs, tools=tools)   # 只重试这一次：再抛就原样上抛
         msg = Message.from_openai(reply.message)
         if reply.usage is not None:
             # 注意 fingerprint 用的是**本次实际发出去的** tools，不是 self._tool_defs()：
@@ -341,7 +371,23 @@ class Agent:
                 )
         return msg
 
-    def _maybe_compress(self, turn: _Turn, tools: Optional[list[dict]]) -> None:
+    @staticmethod
+    def _view_snapshot(turn: _Turn) -> tuple:
+        """视图指纹：(boundary, prune_before, 每条消息的 JSON)。
+
+        判"强制压缩有没有改变要发的请求"用。只比 boundary/prune_before 不够 ——
+        裁剪点前移到同一值、或内容被换而两个标量没变的情形会漏判；逐条序列化比内容
+        才是"请求会不会变"的真相。
+        """
+        return (
+            getattr(turn, "boundary", None),
+            getattr(turn, "prune_before", None),
+            [m.model_dump_json() for m in turn.messages],
+        )
+
+    def _maybe_compress(
+        self, turn: _Turn, tools: Optional[list[dict]], *, force: bool = False
+    ) -> None:
         """发请求前检查一次上下文用量；超阈值就压缩，最多一次。
 
         刻意**不返回**任何状态：压缩成功与否都不改变调用方接下来要做的事（发请求），
@@ -367,10 +413,18 @@ class Agent:
             不要了"，不是"压缩失败了"；吞掉的话封口逻辑（_seal_cancelled_turn）和
             调用方都看不到取消，gRPC 的 CancelTask 会变成一个跑完的任务。
           - 其它异常：同样视为失败，但没有可信的候选边界，不做裁剪。
+
+        force=True 是 400 被动兜底用的（见 _call_model）：上游已经说"超长"了，
+          - **跳过阈值判断**：计数偏低正是 400 的来源，再拿它做门槛就自相矛盾；
+          - **越过 compaction_failed 的闸一次**：不压这次请求必然再失败；
+          - 总结失败时的降级裁剪点允许前移（见 _degrade_after_compaction_failure）；
+          - 成功后不做"压完是否仍超阈值"的复核 —— 紧接着的那次重试就是真复核；
+          - compacting 事件带 "reason": "overflow"，compacted 事件语义不变，仍成对。
+        force=False 的路径与加这个参数之前逐字节一致。
         """
         if self.compressor is None or self.policy is None:
             return
-        if turn.compaction_failed:
+        if turn.compaction_failed and not force:
             # 本次 run 已经失败过：同一份历史、同样的输入，再试只是再花一次调用。
             # 降级（如果有）已经作用在 turn.messages 上，照常发请求即可。
             return
@@ -379,12 +433,16 @@ class Agent:
         except Exception:
             # 计数本身是纯计算，正常不会抛；真抛了也只是"这轮不压"，别把请求也拖下去
             logger.exception("上下文计数失败，跳过本轮压缩检查 session=%s", turn.session_id)
+            if not force:
+                return
+            # 强制路径：计数只用于事件/日志展示，不是门槛，算不出来也照压
+            count = TokenCount(tokens=0, source="unknown")
+        if not force and not self.policy.should_compress(count):
             return
-        if not self.policy.should_compress(count):
-            return
-        self._emit(turn, "compacting", json.dumps(
-            {"tokens": count.tokens, "source": count.source}, ensure_ascii=False,
-        ))
+        compacting = {"tokens": count.tokens, "source": count.source}
+        if force:
+            compacting["reason"] = "overflow"
+        self._emit(turn, "compacting", json.dumps(compacting, ensure_ascii=False))
         latest_before = self.db.latest_compaction(turn.session_id)
         try:
             self.compressor.compress(turn)
@@ -392,7 +450,7 @@ class Agent:
             # ★ 必须排在 except Exception 前面：TaskCancelled 是 Exception 子类。
             raise
         except CompactionError as e:
-            self._degrade_after_compaction_failure(turn, e.boundary, count)
+            self._degrade_after_compaction_failure(turn, e.boundary, count, force=force)
             return
         except Exception:
             logger.exception(
@@ -426,6 +484,8 @@ class Agent:
         self._emit(turn, "compacted", json.dumps(
             {"ok": True, "boundary": turn.boundary}, ensure_ascii=False,
         ))
+        if force:
+            return   # 强制路径的复核就是随后的那次重试，不再单独量一遍
         # 压缩后复核：压完仍超阈值说明这次压得不够（尾部边界 + 保留量本身就超标）。
         # 不重试，只告警 —— 再压一次是同一份历史、同样的输入，大概率同样的结果。
         try:
@@ -463,7 +523,8 @@ class Agent:
         )
 
     def _degrade_after_compaction_failure(
-        self, turn: _Turn, boundary: Optional[int], count: TokenCount
+        self, turn: _Turn, boundary: Optional[int], count: TokenCount,
+        *, force: bool = False,
     ) -> None:
         """总结失败的降级（D1）：把候选边界之前的旧工具输出换成占位符。
 
@@ -475,9 +536,15 @@ class Agent:
         ★ prune_before 进视图状态 → 进指纹。 替换之后旧锚点的 prompt_tokens 描述的
           是替换前的长前缀，必须作废，计数退回估算。
         ★ e.boundary 为 None 时没有可信的裁剪界线，只禁用本次 run 的重试。
+        ★ 例外：force（400 兜底）路径允许裁剪点**前移**到 max(旧, 新)。平时"替换点固定"
+          是为了前缀稳定、缓存命中；但这里请求马上就要失败，只裁到旧界线不够短的话
+          重试必然再 400，正确性优先于缓存。只前移、不后退（后退等于把已替换的又
+          恢复原文，请求更长）；占位符本身短于裁剪阈值，重复裁剪是幂等的。
         """
         turn.compaction_failed = True
         if boundary is not None:
+            if force and turn.prune_before is not None:
+                boundary = max(turn.prune_before, boundary)
             turn.messages = prune_old_tool_outputs(turn.messages, turn.seqs, boundary)
             turn.prune_before = boundary
         logger.warning(

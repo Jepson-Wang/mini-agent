@@ -442,9 +442,11 @@ def test_recover_backfills_missing_result_from_idempotency_table(db, db_path):
     """
     sid = db.create_session()
     db.append_message(sid, Message(role="user", content="发封邮件"))
-    db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
+    seq = db.append_message(
+        sid, Message(role="assistant", tool_calls=[_tool_call("call_1")])
+    )
     # 工具跑完了、幂等表也写了，但进程在 append_message 之前就死了
-    db.record_executed_key("call_1", sid, {"content": "邮件已发送"})
+    db.record_executed_key(sid, seq, 0, "call_1", {"content": "邮件已发送"})
 
     revived = MiniSessionDB(db_path).recover(sid)
 
@@ -457,17 +459,23 @@ def test_recover_backfills_missing_result_from_idempotency_table(db, db_path):
 def test_recover_stubs_when_idempotency_table_has_no_matching_key(db, db_path):
     """幂等表里有别的 key，但没有这个 tool_call 的 → 照样补桩。
 
-    和上一个测试配成一对：证明补桩走的是 **按 tool_call_id 精确查表**，
-    而不是「表里有行就当命中」。少了这个测试，一个把 key 写错的实现也能跑绿。
+    和上一个测试配成一对：证明补桩走的是 **按 (session, assistant_seq, idx)
+    精确查表**，而不是「表里有行就当命中」。少了这个测试，一个把 key 写错的
+    实现也能跑绿。这里的"别的 key"是**同一会话的另一条 assistant**。
     """
     sid = db.create_session()
+    other = db.append_message(
+        sid, Message(role="assistant", tool_calls=[_tool_call("call_999")])
+    )
+    db.append_message(sid, Message(role="tool", tool_call_id="call_999", content="r"))
     db.append_message(sid, Message(role="user", content="发封邮件"))
     db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
-    db.record_executed_key("call_999", sid, {"content": "别人的结果"})  # 不相干的 key
+    # 不相干的 key：别的 assistant 的 idx=0
+    db.record_executed_key(sid, other, 0, "call_999", {"content": "别人的结果"})
 
     revived = MiniSessionDB(db_path).recover(sid)
 
-    assert revived[2].content == _INTERRUPTED
+    assert (revived[-1].tool_call_id, revived[-1].content) == ("call_1", _INTERRUPTED)
 
 
 def test_recover_skips_one_corrupt_row(db, db_path):
@@ -493,14 +501,15 @@ def test_recover_skips_one_corrupt_row(db, db_path):
 
 
 def test_recover_stubs_tool_call_with_empty_id_instead_of_raising(db, db_path):
-    """tool_call 的 id 是空串 → 补桩，不许抛。
+    """tool_call 的 id 是空串、幂等表里也没有 → 补桩，不许抛。
 
     空 id 不是假想情况：ToolCall.id 没有 min_length，而 ToolCall.from_openai 在
     SDK 漏给 id 时默认就填 ""。这样一条消息会被落库。
-    危险在于 get_executed_result 有个「key 不能为空」的守卫——它是用来抓**调用方
-    编程错误**的，完全正当；但 recover 传进去的是**从库里读出来的历史数据**。
-    同一个守卫在这里会把一次数据异常升级成 PersistenceError，让这个会话
-    **永远 --resume 不了**（坏数据在库里，每次读都一样，重试无用）。
+    旧的 get_executed_result 有个「key 不能为空」的守卫，recover 传进去的却是
+    **从库里读出来的历史数据** —— 同一个守卫会把一次数据异常升级成
+    PersistenceError，让这个会话**永远 --resume 不了**。
+    现在键是 (session, seq, idx)，空 id 照常查表、守卫已删；查表命中的情况见
+    test_idempotency_scope::test_empty_tool_call_id_backfills_real_result_from_table。
 
     recover 面对历史数据的铁律：任何「这不该发生」都降级，不抛。
     """
@@ -529,8 +538,10 @@ def test_recover_stubs_when_cached_content_is_not_a_string(db, db_path, bad_cont
     record_executed_key 的签名收任意 dict，没有任何东西强制形状。读侧必须自己扛。
     """
     sid = db.create_session()
-    db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
-    db.record_executed_key("call_1", sid, {"content": bad_content})
+    seq = db.append_message(
+        sid, Message(role="assistant", tool_calls=[_tool_call("call_1")])
+    )
+    db.record_executed_key(sid, seq, 0, "call_1", {"content": bad_content})
 
     revived = MiniSessionDB(db_path).recover(sid)
 
@@ -548,14 +559,17 @@ def test_recover_stubs_when_idempotency_row_is_corrupt(db, db_path):
     """
     sid = db.create_session()
     db.append_message(sid, Message(role="user", content="发封邮件"))
-    db.append_message(sid, Message(role="assistant", tool_calls=[_tool_call("call_1")]))
+    seq = db.append_message(
+        sid, Message(role="assistant", tool_calls=[_tool_call("call_1")])
+    )
 
     # 绕过 MiniSessionDB，直接塞一行坏 JSON（模拟 record_executed_key 写到一半断电）
     raw = sqlite3.connect(db_path, isolation_level=None)
     raw.execute(
-        "INSERT INTO executed_keys (idempotency_key, session_id, result, created_at) "
-        "VALUES (?, ?, ?, ?);",
-        ("call_1", sid, '{"content": "邮件已发', int(time.time())),
+        "INSERT INTO executed_keys "
+        "(session_id, assistant_seq, tool_index, tool_call_id, result, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?);",
+        (sid, seq, 0, "call_1", '{"content": "邮件已发', int(time.time())),
     )
     raw.close()
 
@@ -569,19 +583,32 @@ def test_recover_stubs_when_idempotency_row_is_corrupt(db, db_path):
 # 5. 幂等表：first-write-wins
 # --------------------------------------------------------------------------
 
+def _session_with_assistant(db) -> tuple[str, int]:
+    """幂等记录有外键指向 messages，得先有一条 assistant 才能写。返回 (sid, seq)。"""
+    sid = db.create_session()
+    seq = db.append_message(
+        sid, Message(role="assistant", tool_calls=[_tool_call("k1")])
+    )
+    return sid, seq
+
+
 def test_idempotency_first_write_wins(db):
     """幂等的全部意义：第一次写进去的结果，就是唯一权威值。
 
     重放时哪怕传了个不同的 result，也必须原样拿回第一次那个 ——
     否则「重放」就变成了「覆盖」，幂等表就白建了。
     """
-    sid = db.create_session()
+    sid, seq = _session_with_assistant(db)
 
-    is_first, canonical = db.record_executed_key("k1", sid, {"ok": True, "text": "第一次"})
+    is_first, canonical = db.record_executed_key(
+        sid, seq, 0, "k1", {"ok": True, "text": "第一次"}
+    )
     assert is_first is True
     assert canonical == {"ok": True, "text": "第一次"}
 
-    is_first, canonical = db.record_executed_key("k1", sid, {"ok": False, "text": "重放"})
+    is_first, canonical = db.record_executed_key(
+        sid, seq, 0, "k1", {"ok": False, "text": "重放"}
+    )
     assert is_first is False
     assert canonical == {"ok": True, "text": "第一次"}   # ← 没被覆盖
 
@@ -591,26 +618,25 @@ def test_idempotency_first_write_wins(db):
 
 def test_idempotency_survives_restart(db, db_path):
     """幂等表也得抗崩溃：重启后同一个 key 依然认得出这是重放。"""
-    sid = db.create_session()
-    db.record_executed_key("k1", sid, {"ok": True})
+    sid, seq = _session_with_assistant(db)
+    db.record_executed_key(sid, seq, 0, "k1", {"ok": True})
 
     revived = MiniSessionDB(db_path)
-    assert revived.get_executed_result("k1") == {"ok": True}
-    assert revived.record_executed_key("k1", sid, {"ok": False}) == (False, {"ok": True})
+    assert revived.get_executed_result(sid, seq, 0, "k1") == {"ok": True}
+    assert revived.record_executed_key(sid, seq, 0, "k1", {"ok": False}) == (
+        False, {"ok": True},
+    )
 
 
 def test_get_executed_result_miss_returns_none(db):
-    assert db.get_executed_result("never_written") is None
-
-
-def test_get_executed_result_rejects_empty_key(db):
-    with pytest.raises(PersistenceError):
-        db.get_executed_result("")
+    sid, seq = _session_with_assistant(db)
+    assert db.get_executed_result(sid, seq, 0, "never_written") is None
 
 
 def test_record_executed_key_rejects_non_dict(db):
+    sid, seq = _session_with_assistant(db)
     with pytest.raises(PersistenceError):
-        db.record_executed_key("k", db.create_session(), "不是字典")
+        db.record_executed_key(sid, seq, 0, "k", "不是字典")
 
 
 def test_chinese_result_stored_unescaped(db):
@@ -618,12 +644,107 @@ def test_chinese_result_stored_unescaped(db):
 
     不只是好看 —— 转义后体积翻三倍，而且拿 sqlite3 命令行查库时根本没法读。
     """
-    sid = db.create_session()
-    db.record_executed_key("k", sid, {"text": "中文"})
+    sid, seq = _session_with_assistant(db)
+    db.record_executed_key(sid, seq, 0, "k", {"text": "中文"})
 
     stored = db.conn.execute(
-        "SELECT result FROM executed_keys WHERE idempotency_key = 'k';"
+        "SELECT result FROM executed_keys WHERE session_id = ? AND assistant_seq = ?;",
+        (sid, seq),
     ).fetchone()["result"]
     assert "中文" in stored
     assert "\\u4e2d" not in stored
     assert json.loads(stored) == {"text": "中文"}
+
+
+# --------------------------------------------------------------------------
+# ping：给 gRPC 的 Health 用的自检
+# --------------------------------------------------------------------------
+
+def test_ping_ok_on_healthy_db(db):
+    db.ping()          # 不抛就是通过
+
+
+def test_ping_raises_persistence_error_when_db_is_gone(db_path):
+    """库用不了时必须抛 PersistenceError，不是裸的 sqlite 异常。
+
+    调用方是 grpcserver 的 Health，它只 except PersistenceError —— 漏一个裸
+    sqlite3.Error 出去，那条 except 就白写了，Health 会直接把异常抛回 gRPC，
+    对面看到的是 UNKNOWN 而不是"问到了，它说自己不好"。
+
+    这里自己建一个 db 而不是用 db fixture：下面要 close 掉连接，而一个被关掉
+    的连接留在共享 fixture 上会污染后面的用例（见 test_grpcserver 的 _break_db）。
+    """
+    broken = MiniSessionDB(db_path)
+    broken.conn.close()
+
+    with pytest.raises(PersistenceError):
+        broken.ping()
+
+
+def test_ping_is_read_only(db):
+    """自检不该改库。它会被探针按秒轮询，顺手写一笔的话噪音会很可观。"""
+    sid = db.create_session()
+    before = db.recover(sid)
+    db.ping()
+    assert db.recover(sid) == before
+    assert db.session_exists(sid)
+
+
+# --------------------------------------------------------------------------
+# 线程安全：check_same_thread=False 只是关掉检查，不等于连接可以并发用
+# --------------------------------------------------------------------------
+
+def test_concurrent_read_write_does_not_corrupt(db):
+    """多线程同时读写同一个 db，不能报错，也不能读出坏行。
+
+    这条护的是一个真实 bug：读路径（session_exists / recover /
+    get_executed_result）过去直接调 self.conn.execute，没拿锁。sqlite 本身是
+    serialized 模式，但 Python 的 Connection 带一个共享的语句缓存，conn.execute()
+    是"建游标 + 用缓存"的快捷方式 —— 并发调它就是在并发改那份缓存。实测会随机
+    抛 InterfaceError('bad parameter or other API misuse')、抛 sqlite3 模块内部的
+    IndexError，**并且读回内容为 None / 空串的行**。
+
+    最后那个才是真正危险的：recover() 对坏行的既定策略是"跳过 + 记日志，绝不抛"，
+    所以这个竞态的表现是一条消息从 transcript 里静悄悄消失，没有任何人报错。
+    CLI 单线程时碰不到，是 gRPC surface 让它变得可达。
+
+    断言里检查条数而不只是"没抛异常"：只看异常的话，静默丢消息这个最坏的
+    分支恰好检不出来。
+    """
+    import sys
+    import threading
+
+    # 把线程切换间隔调到最小,好让竞态**稳定**复现。不调的话默认 5ms 一次切换,
+    # 四个线程常常各自跑完一整段才被换下去,窗口撞不上 —— 实测漏检率约三分之一,
+    # 那样这条用例就成了"有时候能发现问题"的摆设。
+    # 这是进程级设置,必须还回去(用 try/finally,断言失败时也要还)。
+    old_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+
+    sids = [db.create_session() for _ in range(6)]
+    rounds = 80
+    errors: list[str] = []
+
+    def worker(sid: str) -> None:
+        try:
+            for i in range(rounds):
+                db.session_exists(sid)
+                db.append_message(sid, Message(role="user", content=f"{sid}-{i}"))
+                db.recover(sid)
+        except Exception as e:                      # noqa: BLE001 —— 要的就是"任何异常"
+            errors.append(f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=worker, args=(s,)) for s in sids]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+    finally:
+        sys.setswitchinterval(old_interval)
+
+    assert errors == []
+    for sid in sids:
+        msgs = db.recover(sid)
+        assert len(msgs) == rounds, f"{sid} 少了消息：{len(msgs)} != {rounds}"
+        assert [m.content for m in msgs] == [f"{sid}-{i}" for i in range(rounds)]

@@ -92,3 +92,69 @@ def test_write_rejects_parent_traversal(ws):
 
 def test_empty_path_rejected(ws):
     assert "不能为空" in json.loads(read_file(""))["error"]
+
+
+# ---------------------------------------------------------------------------
+# 沙箱根目录本身（这一层出过事：边界对，根选错了）
+# ---------------------------------------------------------------------------
+
+def test_default_root_is_not_cwd(tmp_path, monkeypatch):
+    """没设 MINI_AGENT_WORKSPACE 时，沙箱根**不能**是当前目录。
+
+    这条是回归测试，护的是一个真实漏洞：根目录曾经默认 os.getcwd()，而进程
+    通常就是从仓库根启动的，于是 .env 落在沙箱内 —— 模型一句 read_file('.env')
+    就能把 API key 读出来并跟着回答回显给用户，正好是 file_tools 模块开头
+    声称要防的那件事。边界（resolve + is_relative_to）一直是对的，错的是根。
+    """
+    from mini_agent.config import workspace_root
+
+    monkeypatch.delenv("MINI_AGENT_WORKSPACE", raising=False)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=sk-should-not-be-readable",
+                                   encoding="utf-8")
+
+    assert workspace_root() != tmp_path.resolve()
+
+    out = json.loads(read_file(".env"))
+    assert "error" in out                       # 不存在 或 越界，都行
+    assert "sk-should-not-be-readable" not in json.dumps(out, ensure_ascii=False)
+
+
+def test_default_root_lives_under_home(monkeypatch):
+    """默认沙箱挂在 <home>/workspace 下，和 state.db 是兄弟而不是祖先。
+
+    是兄弟很关键：settings.home 本身当沙箱根的话，模型能直接 read_file('state.db')
+    （虽然会因为不是 UTF-8 被挡回来）和 write_file('state.db', ...) 把库写坏。
+    """
+    from mini_agent.config import settings, workspace_root
+
+    monkeypatch.delenv("MINI_AGENT_WORKSPACE", raising=False)
+    root = workspace_root()
+    assert root.parent == settings.home.resolve()
+    assert root != settings.home.resolve()
+
+
+def test_unusable_workspace_reports_json_not_raw_exception(tmp_path, monkeypatch):
+    """工作区根目录建不出来时，三个工具都要给 {"error": ...}，且不带绝对路径。
+
+    护的是一条真实的泄露路径：workspace_root() 内部会 mkdir，失败抛的是裸
+    OSError。不接住的话它会穿过 read_file —— registry.dispatch 兜得住不至于
+    打死 agent，但它会把异常文本包成 "Tool failed: ..." 回给模型，而那段文本
+    里带着**绝对路径**，跟着 tool_result 事件流到 Go、写进任务详情、回显给用户。
+
+    `_rel()` 存在的全部理由就是不让绝对路径漏给模型，这条路等于从后门送出去。
+    """
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("我是个文件，不是目录", encoding="utf-8")
+    monkeypatch.setenv("MINI_AGENT_WORKSPACE", str(blocker / "sub"))
+
+    for label, call in [
+        ("read_file", lambda: read_file("a.txt")),
+        ("write_file", lambda: write_file("a.txt", "x")),
+        ("list_dir", lambda: list_dir(".")),
+    ]:
+        out = call()                       # 不抛就是第一关过了
+        parsed = json.loads(out)           # 一定是合法 JSON
+        assert "error" in parsed, label
+        assert str(tmp_path) not in out, f"{label} 把绝对路径漏出去了"
+        assert "工作区根目录不可用" in parsed["error"], label

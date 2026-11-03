@@ -15,6 +15,7 @@ import json
 import pytest
 
 from mini_agent.agent import Agent
+from mini_agent.llm import LLMReply
 from mini_agent.schema import Message
 from mini_agent.tools import registry as registry_mod
 from mini_agent.tools.registry import registry
@@ -290,10 +291,13 @@ def test_retry_after_crash_mid_tool_turn_does_not_duplicate_the_user_message(
     def flaky(messages, tools=None):
         calls["n"] += 1
         if calls["n"] == 1:
-            return _tool_call_msg("call_1", "echo", {"text": "hi"})
-        if calls["n"] == 2:
+            msg = _tool_call_msg("call_1", "echo", {"text": "hi"})
+        elif calls["n"] == 2:
             raise RuntimeError("LLM 超时")          # 工具已跑完、结果已落库
-        return FakeMessage(content="done")
+        else:
+            msg = FakeMessage(content="done")
+        # 返回值和真 call_llm 同形（LLMReply）；这里不带 usage，与上游没给用量一致
+        return LLMReply(message=msg, usage=None)
 
     monkeypatch.setattr("mini_agent.agent.call_llm", flaky)
     agent = Agent(db=db, toolset={"t"})

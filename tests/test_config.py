@@ -29,7 +29,7 @@ def test_repr_hides_secrets():
     assert "sk-REAL-KEY-DO-NOT-LOG" not in r
     assert "TOKEN-DO-NOT-LOG" not in r
     # 但非密钥字段还要看得见，否则 repr 就没用了。
-    assert "deepseek-v4-flash" in r or "model=" in r
+    assert "deepseek-flash" in r or "model=" in r
 
 
 def test_str_hides_secrets_too():
@@ -80,3 +80,12 @@ def test_positive_context_window_is_used(monkeypatch):
 
     monkeypatch.setenv("MINI_AGENT_CONTEXT_WINDOW", "64000")
     assert _positive_int_env("MINI_AGENT_CONTEXT_WINDOW", 128_000) == 64_000
+
+
+def test_default_model_is_deepseek_flash(monkeypatch):
+    """未设 MINI_AGENT_MODEL 时默认 deepseek-flash（旧别名 deepseek-v4-flash 已退役）。"""
+    from mini_agent.config import _load_settings
+
+    monkeypatch.delenv("MINI_AGENT_MODEL", raising=False)
+    assert _load_settings().model == "deepseek-flash"
+    assert Settings(deepseek_api_key="x").model == "deepseek-flash"

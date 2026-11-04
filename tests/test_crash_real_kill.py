@@ -53,8 +53,10 @@ def _spawn(mode: str, db_path: Path, sentinel: Path, log: Path) -> subprocess.Po
       里那句 `from mini_agent.persistence... import` 只在装了 editable 包的环境里
       才成立。没装的机器上这四个测试会全部以 ModuleNotFoundError 提前退出，而且
       报错藏在 victim.err 里，看起来像崩溃恢复坏了。
-      这里做的事和 pyproject 给 pytest 配 `pythonpath = ["."]` 完全等价：把项目根
-      喂给子进程，让测试自带环境、不依赖装没装。
+      这里做的事和 pyproject 给 pytest 配 `pythonpath = ["."]` 同一个目的：把项目根
+      喂给子进程，让测试自带环境、不依赖装没装。区别是这里**前插**并保留调用方原有
+      的 PYTHONPATH（见下），而且项目根排在最前 —— 于是在 worktree 里跑时，子进程
+      import 的是 worktree 的代码，而不是 editable 安装指向的主工作区副本。
     """
     # 前插而不是覆盖：调用方（CI、开发者）可能已经靠 PYTHONPATH 提供了别的依赖
     # 路径，直接覆盖会把它们丢掉；放在最前面则保证 worktree/本仓库的代码优先于

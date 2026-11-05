@@ -123,6 +123,36 @@ def test_corrupt_db_file_gives_a_readable_message_not_a_traceback(cli_env, monke
     assert "删掉它即可重新开始" in err          # 必须给出路
 
 
+def test_a_failed_turn_does_not_kill_the_repl(cli, monkeypatch, capsys):
+    """单轮对话抛异常时，REPL 必须活下来，用户接着能说下一句。
+
+    LLM 调用会因为网络抖动、429、工具漏出异常而失败，这些都是**单轮**的问题。
+    run_conversation 的异常原先直接冲出 while 循环 → finally → 退出 main()。
+    """
+    inputs = iter(["会炸的一句", "还能继续说话", "exit"])
+    monkeypatch.setattr("builtins.input", lambda *a: next(inputs))
+
+    seen = []
+
+    def flaky(self, session_id, user_message, **kwargs):
+        seen.append(user_message)
+        if len(seen) == 1:
+            raise RuntimeError("connection reset by peer")
+        return {"final_response": "第二轮正常", "completed": True, "used_turns": 1}
+
+    monkeypatch.setattr(M.Agent, "run_conversation", flaky)
+    monkeypatch.setattr(sys, "argv", ["mini_agent"])
+
+    M.main()                                   # 不该抛，也不该提前退出
+
+    assert seen == ["会炸的一句", "还能继续说话"]
+    captured = capsys.readouterr()
+    assert "第二轮正常" in captured.out
+    # 错误要如实报出来，且必须告诉用户「原样重发」
+    assert "connection reset by peer" in captured.err
+    assert "重发" in captured.err
+
+
 def test_resume_nonexistent_session_exits_before_touching_anything(cli, monkeypatch):
     """--resume 一个不存在的 sid：早报错退出，不建会话、不写库。"""
     monkeypatch.setattr(sys, "argv", ["mini_agent", "--resume", "sess_ghost"])

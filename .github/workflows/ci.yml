@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # 手动触发：同一个提交多跑几次，看计时类测试在共享 runner 上稳不稳。
+  workflow_dispatch:
+
+# 同一个 PR 连推几次，只有最新那次的结论有意义，旧的直接取消省时间。
+#
+# ★ 非 PR 事件用 run_id 而不是 ref 做 group。同一个 group 里**排队中**的 run
+#   会被新来的顶掉——这和 cancel-in-progress 无关，那个开关只管正在跑的。
+#   用 ref 的话 main 连推三次，中间那次就永远没有结论，"哪个提交弄红的"查不清；
+#   连续 workflow_dispatch 也会互相吞。run_id 让每次运行自成一组。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# 最小权限：CI 只需要读代码。测试跑的是项目自己的工具代码，token 越弱越好。
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Windows runner 默认是 pwsh，下面带 \ 续行的 protoc 命令在它底下跑不了。
+    # 统一 bash（Windows runner 自带 Git Bash），三个组合执行一字不差的同一份脚本。
+    shell: bash
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    # 默认 360 分钟。并发 / 崩溃测试真死锁时，15 分钟止损。
+    timeout-minutes: 15
+    strategy:
+      # 一个组合挂了不连坐取消其它组合：Linux / Windows 结果的对比本身就是诊断信息。
+      fail-fast: false
+      matrix:
+        # 不做全排列，两端版本 + 两个平台，pairwise 覆盖。
+        include:
+          - { os: ubuntu-latest, python: "3.11" }   # requires-python 的下限
+          - { os: ubuntu-latest, python: "3.15" }   # 当前最新正式版
+          # 与本地开发机同 OS、同版本：和本机只差"干净环境"这一个变量，
+          # 本机真 kill 测试报 disk I/O error 时，靠它判断是环境问题还是代码问题。
+          - { os: windows-latest, python: "3.14" }
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # 默认会把 token 写进 .git/config，被测代码能读到它。
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          # 只缓存下载下来的 wheel，不缓存 venv：每次仍重新解析版本，不会锁死在旧依赖上。
+          # 依赖没钉版本而 key 固定，命中后缓存不再更新，所以收益有限——图的是少下载，不是提速。
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install
+        # pyproject.toml 是依赖的唯一真相。
+        # 必须 editable：tests/crash_victim.py 是独立子进程，sys.path[0] 是 tests/，
+        # pytest 的 pythonpath 配置管不到它，只能靠"包已安装"来 import mini_agent。
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pip list   # 没有 lockfile：把这次实际装上的版本留在日志里，挂了能对照
+
+      - name: Generate protobuf stubs
+        # 生成代码不入库。不生成的话 test_grpcserver.py 在收集阶段就 ImportError，整轮报错。
+        # 同一环境、同一版 grpcio-tools 现场生成，gencode 与 protobuf runtime 版本必然匹配。
+        # 与 README「protoc」一节保持一字不差。
+        run: |
+          python -m grpc_tools.protoc \
+            --proto_path=mini_agent/proto \
+            --python_out=mini_agent/gen \
+            --grpc_python_out=mini_agent/gen \
+            --pyi_out=mini_agent/gen \
+            mini_agent/proto/agent/v1/agent.proto
+
+      # 两套测试的 basetemp 分开：pytest 每次运行开始都会清空 basetemp，共用会互相覆盖。
+      - name: Fast tests
+        id: fast
+        run: python -m pytest -m "not slow" --basetemp="$RUNNER_TEMP/pytest-fast"
+
+      - name: Slow tests (real kill)
+        id: slow
+        # fast 红了也照跑：两者测的东西不同，一个红不该盖住另一个的信号。
+        # 安装 / protoc 挂了（fast 为 skipped）就不跑，免得制造重复的红；被取消时也不跑。
+        if: ${{ !cancelled() && (success() || steps.fast.outcome == 'failure') }}
+        run: python -m pytest -m slow --basetemp="$RUNNER_TEMP/pytest-slow"
+
+      - name: Upload crash-test leftovers
+        # 慢测试失败时，kill 之后磁盘上剩下的 state.db / -wal / -shm / victim.err 就是现场，
+        # 下载下来能直接用 sqlite3 查。
+        if: ${{ failure() && steps.slow.outcome == 'failure' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: slow-tmp-${{ matrix.os }}-py${{ matrix.python }}
+          path: ${{ runner.temp }}/pytest-slow
+          retention-days: 7

@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "学习型最小 AI Agent 框架（仿 Hermes 架构，DeepSeek-only）"
 requires-python = ">=3.11"
 dependencies = [
-    "openai>=1.40",        # DeepSeek 用 OpenAI 兼容 SDK（base_url 指向 api.deepseek.com）
+    # DeepSeek 用 OpenAI 兼容 SDK（base_url 指向 api.deepseek.com）。
+    # 上限 <3：干净环境会装到 openai 3.x（CI 首跑装到 3.46），它不再依赖 httpx，
+    # 而本仓库的代码、测试与真机 e2e 都只在 2.x 上验证过。升级 3.x 另起任务。
+    "openai>=1.40,<3",
     "pydantic>=2.7",
     "python-dotenv>=1.0",
     "grpcio>=1.60",        # gRPC surface（mini_agent/grpcserver）的运行时
@@ -15,6 +18,9 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
+    # 测试里直接 import httpx 构造 openai 的异常对象（tests/test_overflow_retry.py）。
+    # 它原本只是 openai 2.x 的传递依赖；直接用到的东西要显式声明。
+    "httpx>=0.27",
 ]
 
 [build-system]
@@ -40,3 +46,14 @@ markers = [
     #   pytest -m slow         单独跑崩溃恢复
     "slow: 需要拉子进程的慢测试（真 kill 崩溃恢复）",
 ]
+# 放这里而不是 CI 命令行里：本地和 CI 跑的必须是同一条命令，否则"本地绿 CI 红"无从对照。
+#
+# -ra：汇总里列出所有 skip / xfail 及其原因。xfail 是"已知坏着"的显式声明，
+#      不能让它安静地躺在那里没人看见。
+# --strict-markers：未注册的 marker 直接报错。不加的话 @pytest.mark.slwo 只是个警告，
+#      那条慢测试就会悄悄混进 -m "not slow"，CI 的 fast / slow 划分随之失真。
+addopts = ["-ra", "--strict-markers"]
+# 单个测试跑超过 120s 就把所有线程的栈 dump 出来。
+# ★ 它只 dump、不杀进程——作用是"卡住时一眼看到卡在哪"，不是止损。
+#   止损靠 CI job 的 timeout-minutes；本地卡住就 Ctrl+C。
+faulthandler_timeout = 120

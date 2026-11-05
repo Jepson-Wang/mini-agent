@@ -180,6 +180,16 @@ Tests need no API key and no network: the `fake_llm` fixture in `tests/conftest.
 
 > `tests/test_delegate.py` and `tests/test_memory.py` are empty and collect nothing. A green run says nothing about M4 / M5 — those parts aren't written yet.
 
+On a fresh clone, run the protoc command from *Quick start* once first; otherwise `test_grpcserver.py` fails with ImportError at collection time.
+
+### CI
+
+`.github/workflows/ci.yml` runs exactly the commands above — nothing CI-specific: `pip install -e ".[dev]"` → protoc codegen → `pytest -m "not slow"` → `pytest -m slow`, on ubuntu/3.11, ubuntu/3.15 and windows/3.14. Everything CI does reproduces locally.
+
+CI does **not** check that `mini_agent/proto/` matches the authoritative copy in the backend repo (it only clones this one). Keeping the two byte-identical is still a manual step, in the order described under *gRPC API* below.
+
+`scripts/e2e_compaction.py` (real-key end-to-end check; needs a DeepSeek key and costs money) is **not** run in CI.
+
 ## gRPC API
 
 <details>
@@ -241,7 +251,7 @@ Milestones follow [`开发路线.md`](开发路线.md) (in Chinese):
 | M4 | Subagent delegation | ⬜ not started (lineage columns already reserved in `sessions`) |
 | M5 | Self-improvement: memory and skills | ⬜ not started |
 | — | Second surface: gRPC server | ✅ |
-| — | GitHub Actions CI | 🚧 in progress |
+| — | GitHub Actions CI | ✅ |
 
 ## Two hard rules
 

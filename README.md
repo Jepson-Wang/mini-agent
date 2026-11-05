@@ -180,6 +180,16 @@ pytest -m slow          # 只跑真 kill 进程的崩溃恢复测试
 
 > 注意 `tests/test_delegate.py` 和 `tests/test_memory.py` 是空文件，它们什么都不收集。所以全绿不代表 M4 / M5 没问题，那两部分还没写。
 
+干净 clone 上要先跑一次「快速开始」里的 protoc 生成命令，否则 `test_grpcserver.py` 在收集阶段就会 ImportError。
+
+### CI
+
+`.github/workflows/ci.yml` 跑的就是上面这几条命令，没有 CI 专属的魔法：`pip install -e ".[dev]"` → protoc 生成 → `pytest -m "not slow"` → `pytest -m slow`，在 ubuntu/3.11、ubuntu/3.15、windows/3.14 三个组合上各跑一遍。本地能复现 CI 的一切。
+
+CI **不检查** `mini_agent/proto/` 和 backend 那份权威副本是否一致（它只 clone 本仓库）。两份是否逐字节相同，目前只能靠改协议时按下文「gRPC 接口」里的顺序手工保证。
+
+`scripts/e2e_compaction.py`（真机端到端验证，需要 DeepSeek key、会产生费用）**不在** CI 里跑。
+
 ## gRPC 接口
 
 <details>
@@ -241,7 +251,7 @@ python -m grpc_tools.protoc \
 | M4 | subagent 委派 | ⬜ 未开始（`sessions` 表的谱系字段已预留） |
 | M5 | self-improving：memory 与 skills | ⬜ 未开始 |
 | — | 第二入口：gRPC 服务端 | ✅ |
-| — | GitHub Actions CI | 🚧 进行中 |
+| — | GitHub Actions CI | ✅ |
 
 ## 两条硬约束
 

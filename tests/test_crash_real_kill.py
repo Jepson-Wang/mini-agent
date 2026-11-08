@@ -46,10 +46,31 @@ _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
 
 def _spawn(mode: str, db_path: Path, sentinel: Path, log: Path) -> subprocess.Popen:
     """把靶子拉起来。stderr 落到文件——靶子被 kill 之后管道读不出东西，
-    真出错时（比如 import 失败）只有文件里还留着现场。"""
+    真出错时（比如 import 失败）只有文件里还留着现场。
+
+    ★ PYTHONPATH 必须显式传，光给 cwd 不够。 `python tests/crash_victim.py` 的
+      sys.path[0] 是**脚本所在目录**（tests/），cwd 根本不进 sys.path —— 所以靶子
+      里那句 `from mini_agent.persistence... import` 只在装了 editable 包的环境里
+      才成立。没装的机器上这四个测试会全部以 ModuleNotFoundError 提前退出，而且
+      报错藏在 victim.err 里，看起来像崩溃恢复坏了。
+      这里做的事和 pyproject 给 pytest 配 `pythonpath = ["."]` 同一个目的：把项目根
+      喂给子进程，让测试自带环境、不依赖装没装。区别是这里**前插**并保留调用方原有
+      的 PYTHONPATH（见下），而且项目根排在最前 —— 于是在 worktree 里跑时，子进程
+      import 的是 worktree 的代码，而不是 editable 安装指向的主工作区副本。
+    """
+    # 前插而不是覆盖：调用方（CI、开发者）可能已经靠 PYTHONPATH 提供了别的依赖
+    # 路径，直接覆盖会把它们丢掉；放在最前面则保证 worktree/本仓库的代码优先于
+    # 任何已安装的 editable 副本被 import。原值为空时只用项目根，避免拼出尾随分隔符
+    # （空项会被解释成 cwd）。
+    prev = os.environ.get("PYTHONPATH", "")
+    env = {
+        **os.environ,
+        "PYTHONPATH": _PROJECT_ROOT + os.pathsep + prev if prev else _PROJECT_ROOT,
+    }
     return subprocess.Popen(
         [sys.executable, _VICTIM, mode, str(db_path), str(sentinel)],
         cwd=_PROJECT_ROOT,
+        env=env,
         stdout=subprocess.DEVNULL,
         stderr=open(log, "w", encoding="utf-8"),
     )
